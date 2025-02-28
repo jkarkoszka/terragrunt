@@ -291,7 +291,10 @@ func dependencyBlocksToModuleDependencies(decodedDependencyBlocks []Dependency) 
 			continue
 		}
 
-		paths = append(paths, decodedDependencyBlock.ConfigPath.AsString())
+		dependencyPath := decodedDependencyBlock.ConfigPath.AsString()
+		if !util.ListContainsElement(paths, dependencyPath) {
+			paths = append(paths, dependencyPath)
+		}
 	}
 
 	return &ModuleDependencies{Paths: paths}

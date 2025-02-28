@@ -367,7 +367,7 @@ func (stack *Stack) ResolveTerraformModules(ctx context.Context, terragruntConfi
 	err = telemetry.Telemetry(ctx, stack.terragruntOptions, "resolve_external_dependencies_for_modules", map[string]interface{}{
 		"working_dir": stack.terragruntOptions.WorkingDir,
 	}, func(childCtx context.Context) error {
-		result, err := stack.resolveExternalDependenciesForModules(ctx, modulesMap, TerraformModulesMap{}, 0)
+		result, err := stack.resolveExternalDependenciesForModules(ctx, modulesMap, modulesMap, 0)
 		if err != nil {
 			return err
 		}
@@ -484,8 +484,7 @@ func (stack *Stack) ResolveTerraformModules(ctx context.Context, terragruntConfi
 // Go through each of the given Terragrunt configuration files and resolve the module that configuration file represents
 // into a TerraformModule struct. Note that this method will NOT fill in the Dependencies field of the TerraformModule
 // struct (see the crosslinkDependencies method for that). Return a map from module path to TerraformModule struct.
-func (stack *Stack) resolveModules(ctx context.Context, canonicalTerragruntConfigPaths []string, howTheseModulesWereFound string) (TerraformModulesMap, error) {
-	modulesMap := TerraformModulesMap{}
+func (stack *Stack) resolveModulesWithModuleMap(ctx context.Context, canonicalTerragruntConfigPaths []string, howTheseModulesWereFound string, modulesMap TerraformModulesMap) (TerraformModulesMap, error) {
 
 	for _, terragruntConfigPath := range canonicalTerragruntConfigPaths {
 		if !util.FileExists(terragruntConfigPath) {
@@ -542,6 +541,11 @@ func (stack *Stack) resolveModules(ctx context.Context, canonicalTerragruntConfi
 	return modulesMap, nil
 }
 
+func (stack *Stack) resolveModules(ctx context.Context, canonicalTerragruntConfigPaths []string, howTheseModulesWereFound string) (TerraformModulesMap, error) {
+	modulesMap := TerraformModulesMap{}
+	return stack.resolveModulesWithModuleMap(ctx, canonicalTerragruntConfigPaths, howTheseModulesWereFound, modulesMap)
+}
+
 // Create a TerraformModule struct for the Terraform module specified by the given Terragrunt configuration file path.
 // Note that this method will NOT fill in the Dependencies field of the TerraformModule struct (see the
 // crosslinkDependencies method for that).
@@ -554,6 +558,8 @@ func (stack *Stack) resolveTerraformModule(ctx context.Context, terragruntConfig
 	if _, ok := modulesMap[modulePath]; ok {
 		return nil, nil
 	}
+
+	stack.terragruntOptions.Logger.Infof("Resolved module path: %s %s", modulePath, howThisModuleWasFound)
 
 	// Clone the options struct so we don't modify the original one. This is especially important as run-all operations
 	// happen concurrently.
@@ -696,7 +702,7 @@ func (stack *Stack) resolveDependenciesForModule(ctx context.Context, module *Te
 
 	howThesePathsWereFound := fmt.Sprintf("dependency of module at '%s'", module.Path)
 
-	result, err := stack.resolveModules(ctx, externalTerragruntConfigPaths, howThesePathsWereFound)
+	result, err := stack.resolveModulesWithModuleMap(ctx, externalTerragruntConfigPaths, howThesePathsWereFound, modulesMap)
 	if err != nil {
 		return nil, err
 	}
@@ -712,9 +718,8 @@ func (stack *Stack) resolveDependenciesForModule(ctx context.Context, module *Te
 // environment the user is trying to apply-all or destroy-all. Therefore, this method also confirms whether the user wants
 // to actually apply those dependencies or just assume they are already applied. Note that this method will NOT fill in
 // the Dependencies field of the TerraformModule struct (see the crosslinkDependencies method for that).
-func (stack *Stack) resolveExternalDependenciesForModules(ctx context.Context, modulesMap, modulesAlreadyProcessed TerraformModulesMap, recursionLevel int) (TerraformModulesMap, error) {
+func (stack *Stack) resolveExternalDependenciesForModules(ctx context.Context, modulesMap, modulesToSkip TerraformModulesMap, recursionLevel int) (TerraformModulesMap, error) {
 	allExternalDependencies := TerraformModulesMap{}
-	modulesToSkip := modulesMap.mergeMaps(modulesAlreadyProcessed)
 
 	// Simple protection from circular dependencies causing a Stack Overflow due to infinite recursion
 	if recursionLevel > maxLevelsOfRecursion {
@@ -725,9 +730,9 @@ func (stack *Stack) resolveExternalDependenciesForModules(ctx context.Context, m
 	for _, key := range sortedKeys {
 		module := modulesMap[key]
 
-		externalDependencies, err := stack.resolveDependenciesForModule(ctx, module, modulesToSkip, false)
+		allDependencies, err := stack.resolveDependenciesForModule(ctx, module, TerraformModulesMap{}, false)
 		if err != nil {
-			return externalDependencies, err
+			return allDependencies, err
 		}
 
 		moduleOpts, err := stack.terragruntOptions.CloneWithConfigPath(config.GetDefaultConfigPath(module.Path))
@@ -735,26 +740,27 @@ func (stack *Stack) resolveExternalDependenciesForModules(ctx context.Context, m
 			return nil, err
 		}
 
-		for _, externalDependency := range externalDependencies {
-			if _, alreadyFound := modulesToSkip[externalDependency.Path]; alreadyFound {
+		for _, dependency := range allDependencies {
+			if _, alreadyFound := modulesToSkip[dependency.Path]; alreadyFound {
 				continue
 			}
 
 			shouldApply := false
 			if !stack.terragruntOptions.IgnoreExternalDependencies {
-				shouldApply, err = module.confirmShouldApplyExternalDependency(ctx, externalDependency, moduleOpts)
+				shouldApply, err = module.confirmShouldApplyExternalDependency(ctx, dependency, moduleOpts)
 				if err != nil {
-					return externalDependencies, err
+					return allDependencies, err
 				}
 			}
 
-			externalDependency.AssumeAlreadyApplied = !shouldApply
-			allExternalDependencies[externalDependency.Path] = externalDependency
+			dependency.AssumeAlreadyApplied = !shouldApply
+			allExternalDependencies[dependency.Path] = dependency
 		}
 	}
 
 	if len(allExternalDependencies) > 0 {
-		recursiveDependencies, err := stack.resolveExternalDependenciesForModules(ctx, allExternalDependencies, modulesMap, recursionLevel+1)
+		newModulesToSkip := modulesToSkip.mergeMaps(allExternalDependencies)
+		recursiveDependencies, err := stack.resolveExternalDependenciesForModules(ctx, allExternalDependencies, newModulesToSkip, recursionLevel+1)
 		if err != nil {
 			return allExternalDependencies, err
 		}
