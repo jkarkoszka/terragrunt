@@ -791,7 +791,29 @@ func readTerragruntConfigAsFuncImpl(ctx *ParsingContext, l log.Logger) function.
 			}
 
 			targetConfigPath := strArgs[0]
-			return ParseTerragruntConfig(ctx, l, targetConfigPath, defaultVal)
+
+			targetConfig := getCleanedTargetConfigPath(targetConfigPath, ctx.TerragruntOptions.TerragruntConfigPath)
+
+			cache := cache.ContextCache[cty.Value](ctx, ReadTerragruntConfigCacheContextKey)
+
+			var (
+				config   cty.Value
+				cacheKey = fmt.Sprintf("parse-terragrunt-config-%v", targetConfig)
+			)
+
+			if cacheConfig, found := cache.Get(ctx, cacheKey); found {
+				config = cacheConfig
+			} else {
+				// Parse the HCL file into an AST body that can be decoded multiple times later without having to re-parse
+				config, err = ParseTerragruntConfig(ctx, l, targetConfigPath, defaultVal)
+				if err != nil {
+					return config, err
+				}
+
+				cache.Put(ctx, cacheKey, config)
+			}
+
+			return config, nil
 		},
 	})
 }
