@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -32,7 +31,6 @@ import (
 	"github.com/gruntwork-io/terragrunt/config"
 	"github.com/gruntwork-io/terragrunt/internal/cli"
 	"github.com/gruntwork-io/terragrunt/internal/errors"
-	"github.com/gruntwork-io/terragrunt/internal/experiment"
 	"github.com/gruntwork-io/terragrunt/internal/remotestate"
 	"github.com/gruntwork-io/terragrunt/internal/report"
 	"github.com/gruntwork-io/terragrunt/options"
@@ -66,15 +64,17 @@ var TerraformCommandsThatUseState = []string{
 	"state",
 }
 
+// TerraformCommandsThatDoNotNeedInit is a list of Terraform commands that do not require 'terraform init' to be executed.
 var TerraformCommandsThatDoNotNeedInit = []string{
 	"version",
-	"terragrunt-info",
-	"graph-dependencies",
 }
 
 var ModuleRegex = regexp.MustCompile(`module[[:blank:]]+".+"`)
 
-const TerraformExtensionGlob = "*.tf"
+const (
+	TerraformExtensionGlob = "*.tf"
+	TofuExtensionGlob      = "*.tofu"
+)
 
 // sourceChangeLocks is a map that keeps track of locks for source changes, to ensure we aren't overriding the generated
 // code while another hook (e.g. `tflint`) is running. We use sync.Map to ensure atomic updates during concurrent access.
@@ -142,7 +142,7 @@ func run(ctx context.Context, l log.Logger, opts *options.TerragruntOptions, r *
 	terragruntOptionsClone.TerraformCommand = CommandNameTerragruntReadConfig
 
 	if err = terragruntOptionsClone.RunWithErrorHandling(ctx, l, r, func() error {
-		return processHooks(ctx, l, terragruntConfig.Terraform.GetAfterHooks(), terragruntOptionsClone, terragruntConfig, nil)
+		return processHooks(ctx, l, terragruntConfig.Terraform.GetAfterHooks(), terragruntOptionsClone, terragruntConfig, nil, r)
 	}); err != nil {
 		return target.runErrorCallback(l, opts, terragruntConfig, err)
 	}
@@ -364,7 +364,7 @@ func runTerragruntWithConfig(
 		return err
 	}
 
-	return RunActionWithHooks(ctx, l, "terraform", opts, cfg, func(ctx context.Context) error {
+	return RunActionWithHooks(ctx, l, "terraform", opts, cfg, r, func(ctx context.Context) error {
 		runTerraformError := RunTerraformWithRetry(ctx, l, opts, r)
 
 		var lockFileError error
@@ -450,10 +450,10 @@ func ShouldCopyLockFile(args cli.Args, terraformConfig *config.TerraformConfig) 
 
 // RunActionWithHooks runs the given action function surrounded by hooks. That is, run the before hooks first, then, if there were no
 // errors, run the action, and finally, run the after hooks. Return any errors hit from the hooks or action.
-func RunActionWithHooks(ctx context.Context, l log.Logger, description string, terragruntOptions *options.TerragruntOptions, terragruntConfig *config.TerragruntConfig, action func(ctx context.Context) error) error {
+func RunActionWithHooks(ctx context.Context, l log.Logger, description string, terragruntOptions *options.TerragruntOptions, terragruntConfig *config.TerragruntConfig, r *report.Report, action func(ctx context.Context) error) error {
 	var allErrors *errors.MultiError
 
-	beforeHookErrors := processHooks(ctx, l, terragruntConfig.Terraform.GetBeforeHooks(), terragruntOptions, terragruntConfig, allErrors)
+	beforeHookErrors := processHooks(ctx, l, terragruntConfig.Terraform.GetBeforeHooks(), terragruntOptions, terragruntConfig, allErrors, r)
 	allErrors = allErrors.Append(beforeHookErrors)
 
 	var actionErrors error
@@ -464,8 +464,8 @@ func RunActionWithHooks(ctx context.Context, l log.Logger, description string, t
 		l.Errorf("Errors encountered running before_hooks. Not running '%s'.", description)
 	}
 
-	postHookErrors := processHooks(ctx, l, terragruntConfig.Terraform.GetAfterHooks(), terragruntOptions, terragruntConfig, allErrors)
-	errorHookErrors := processErrorHooks(ctx, l, terragruntConfig.Terraform.GetErrorHooks(), terragruntOptions, allErrors)
+	postHookErrors := processHooks(ctx, l, terragruntConfig.Terraform.GetAfterHooks(), terragruntOptions, terragruntConfig, allErrors, r)
+	errorHookErrors := processErrorHooks(ctx, l, terragruntConfig.Terraform.GetErrorHooks(), terragruntOptions, allErrors, r)
 	allErrors = allErrors.Append(postHookErrors, errorHookErrors)
 
 	return allErrors.ErrorOrNil()
@@ -508,14 +508,12 @@ func RunTerraformWithRetry(ctx context.Context, l log.Logger, opts *options.Terr
 					exitCode.ResetSuccess()
 
 					// Also assume this retry will succeed for now. If it doesn't, we'll update this later.
-					if opts.Experiments.Evaluate(experiment.Report) {
-						if err := r.EndRun(
-							opts.WorkingDir,
-							report.WithResult(report.ResultSucceeded),
-							report.WithReason(report.ReasonRetrySucceeded),
-						); err != nil {
-							l.Errorf("Error ending run for unit %s: %v", opts.WorkingDir, err)
-						}
+					if err := r.EndRun(
+						opts.WorkingDir,
+						report.WithResult(report.ResultSucceeded),
+						report.WithReason(report.ReasonRetrySucceeded),
+					); err != nil {
+						l.Errorf("Error ending run for unit %s: %v", opts.WorkingDir, err)
 					}
 				}
 
@@ -547,15 +545,24 @@ func IsRetryable(opts *options.TerragruntOptions, out *util.CmdOutput) bool {
 // to the TerraformCliArgs
 func prepareInitCommand(ctx context.Context, l log.Logger, terragruntOptions *options.TerragruntOptions, terragruntConfig *config.TerragruntConfig) error {
 	if terragruntConfig.RemoteState != nil {
-		// Initialize the remote state if necessary  (e.g. create S3 bucket and DynamoDB table)
-		remoteStateNeedsInit, err := remoteStateNeedsInit(ctx, l, terragruntConfig.RemoteState, terragruntOptions)
-		if err != nil {
-			return err
-		}
-
-		if remoteStateNeedsInit {
+		// When backend bootstrap is explicitly enabled, proactively bootstrap the backend
+		// (e.g., ensure S3 bucket and DynamoDB table exist). The bootstrap operations are idempotent
+		// and safe to run repeatedly.
+		if terragruntOptions.BackendBootstrap {
 			if err := terragruntConfig.RemoteState.Bootstrap(ctx, l, terragruntOptions); err != nil {
 				return err
+			}
+		} else {
+			// Otherwise, initialize the remote state only if necessary
+			remoteStateNeedsInit, err := remoteStateNeedsInit(ctx, l, terragruntConfig.RemoteState, terragruntOptions)
+			if err != nil {
+				return err
+			}
+
+			if remoteStateNeedsInit {
+				if err := terragruntConfig.RemoteState.Bootstrap(ctx, l, terragruntOptions); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -568,25 +575,7 @@ func prepareInitCommand(ctx context.Context, l log.Logger, terragruntOptions *op
 
 // CheckFolderContainsTerraformCode checks if the folder contains Terraform/OpenTofu code
 func CheckFolderContainsTerraformCode(terragruntOptions *options.TerragruntOptions) error {
-	found := false
-
-	err := filepath.WalkDir(terragruntOptions.WorkingDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if d.IsDir() {
-			return nil
-		}
-
-		if isTofuFile(path) {
-			found = true
-
-			return filepath.SkipAll
-		}
-
-		return nil
-	})
+	found, err := util.DirContainsTFFiles(terragruntOptions.WorkingDir)
 	if err != nil {
 		return err
 	}
@@ -598,24 +587,6 @@ func CheckFolderContainsTerraformCode(terragruntOptions *options.TerragruntOptio
 	return nil
 }
 
-// isTofuFile checks if a given file is an OpenTofu/Terraform file
-func isTofuFile(path string) bool {
-	suffixes := []string{
-		".tf",
-		".tofu",
-		".tf.json",
-		".tofu.json",
-	}
-
-	for _, suffix := range suffixes {
-		if strings.HasSuffix(path, suffix) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // Check that the specified Terraform code defines a backend { ... } block and return an error if doesn't
 func checkTerraformCodeDefinesBackend(opts *options.TerragruntOptions, backendType string) error {
 	terraformBackendRegexp, err := regexp.Compile(fmt.Sprintf(`backend[[:blank:]]+"%s"`, backendType))
@@ -623,7 +594,8 @@ func checkTerraformCodeDefinesBackend(opts *options.TerragruntOptions, backendTy
 		return errors.New(err)
 	}
 
-	definesBackend, err := util.Grep(terraformBackendRegexp, opts.WorkingDir+"/**/*.tf")
+	// Check for backend definitions in .tf and .tofu files using WalkDir
+	definesBackend, err := util.RegexFoundInTFFiles(opts.WorkingDir, terraformBackendRegexp)
 	if err != nil {
 		return err
 	}
@@ -791,7 +763,13 @@ func modulesNeedInit(terragruntOptions *options.TerragruntOptions) (bool, error)
 		return true, nil
 	}
 
-	return util.Grep(ModuleRegex, fmt.Sprintf("%s/%s", terragruntOptions.WorkingDir, TerraformExtensionGlob))
+	// Check for module definitions in .tf and .tofu files using WalkDir
+	hasModuleDefinition, err := util.RegexFoundInTFFiles(terragruntOptions.WorkingDir, ModuleRegex)
+	if err != nil {
+		return false, err
+	}
+
+	return hasModuleDefinition, nil
 }
 
 // remoteStateNeedsInit determines whether remote state initialization is required before running a Terraform command.
