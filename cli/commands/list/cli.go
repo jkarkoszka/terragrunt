@@ -3,7 +3,6 @@
 package list
 
 import (
-	runCmd "github.com/gruntwork-io/terragrunt/cli/commands/run"
 	"github.com/gruntwork-io/terragrunt/cli/flags"
 	"github.com/gruntwork-io/terragrunt/cli/flags/shared"
 	"github.com/gruntwork-io/terragrunt/internal/cli"
@@ -41,7 +40,7 @@ func NewFlags(opts *Options, prefix flags.Prefix) cli.Flags {
 			Name:        FormatFlagName,
 			EnvVars:     tgPrefix.EnvVars(FormatFlagName),
 			Destination: &opts.Format,
-			Usage:       "Output format for list results. Valid values: text, tree, long.",
+			Usage:       "Output format for list results. Valid values: text, tree, long, dot.",
 			DefaultText: FormatText,
 		}),
 		flags.NewFlag(&cli.BoolFlag{
@@ -99,8 +98,8 @@ func NewCommand(l log.Logger, opts *options.TerragruntOptions) *cli.Command {
 
 	// Base flags for list plus backend/feature flags
 	flags := NewFlags(cmdOpts, prefix)
-	flags = append(flags, runCmd.NewBackendFlags(l, opts, prefix)...)
-	flags = append(flags, runCmd.NewFeatureFlags(l, opts, prefix)...)
+	flags = append(flags, shared.NewBackendFlags(opts, prefix)...)
+	flags = append(flags, shared.NewFeatureFlags(opts, prefix)...)
 
 	return &cli.Command{
 		Name:    CommandName,

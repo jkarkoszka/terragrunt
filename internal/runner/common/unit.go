@@ -2,7 +2,6 @@ package common
 
 import (
 	"fmt"
-	"io"
 	"maps"
 	"path/filepath"
 	"slices"
@@ -33,6 +32,7 @@ type Unit struct {
 	Config               config.TerragruntConfig
 	AssumeAlreadyApplied bool
 	FlagExcluded         bool
+	IsExternal           bool // Set to true if this unit is outside the working directory (discovered as external dependency)
 }
 
 // per-path output locks to serialize flushes for the same unit
@@ -56,6 +56,21 @@ type Units []*Unit
 
 type UnitsMap map[string]*Unit
 
+// EnsureAbsolutePath ensures a path is absolute, converting it if necessary.
+// Returns the absolute path and any error encountered during conversion.
+func EnsureAbsolutePath(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", errors.Errorf("failed to get absolute path for %s: %w", path, err)
+	}
+
+	return absPath, nil
+}
+
 // String renders this unit as a human-readable string
 func (unit *Unit) String() string {
 	var dependencies = make([]string, 0, len(unit.Dependencies))
@@ -76,12 +91,7 @@ func (unit *Unit) FlushOutput() error {
 	}
 
 	if writer, ok := unit.TerragruntOptions.Writer.(*UnitWriter); ok {
-		key := unit.Path
-		if !filepath.IsAbs(key) {
-			if abs, err := filepath.Abs(key); err == nil {
-				key = abs
-			}
-		}
+		key := unit.AbsolutePath(unit.Logger)
 
 		mu := getUnitOutputLock(key)
 
@@ -166,6 +176,25 @@ func (unit *Unit) FindUnitInPath(targetDirs []string) bool {
 	return slices.Contains(targetDirs, unit.Path)
 }
 
+// AbsolutePath returns the absolute path of the unit.
+// If path conversion fails, returns the original path and logs a warning.
+func (unit *Unit) AbsolutePath(l log.Logger) string {
+	if filepath.IsAbs(unit.Path) {
+		return unit.Path
+	}
+
+	absPath, err := filepath.Abs(unit.Path)
+	if err != nil {
+		if l != nil {
+			l.Warnf("Failed to get absolute path for %s: %v", unit.Path, err)
+		}
+
+		return unit.Path
+	}
+
+	return absPath
+}
+
 // getDependenciesForUnit Get the list of units this unit depends on
 func (unit *Unit) getDependenciesForUnit(unitsMap UnitsMap, terragruntConfigPaths []string) (Units, error) {
 	dependencies := Units{}
@@ -177,8 +206,7 @@ func (unit *Unit) getDependenciesForUnit(unitsMap UnitsMap, terragruntConfigPath
 	for _, dependencyPath := range unit.Config.Dependencies.Paths {
 		dependencyUnitPath, err := util.CanonicalPath(dependencyPath, unit.Path)
 		if err != nil {
-			// TODO: Remove lint suppression
-			return dependencies, nil //nolint:nilerr
+			return dependencies, errors.Errorf("failed to resolve canonical path for dependency %s: %w", dependencyPath, err)
 		}
 
 		if files.FileExists(dependencyUnitPath) && !files.IsDir(dependencyUnitPath) {
@@ -223,9 +251,11 @@ func (unitsMap UnitsMap) FindByPath(path string) *Unit {
 	return nil
 }
 
-// CrossLinkDependencies Go through each unit in the given map and cross-link its dependencies to the other units in that same map. If
-// a dependency is referenced that is not in the given map, return an error.
-func (unitsMap UnitsMap) CrossLinkDependencies(canonicalTerragruntConfigPaths []string) (Units, error) {
+// ConvertDiscoveryToRunner converts units from discovery domain to runner domain by resolving
+// Component interface dependencies into concrete *Unit pointer dependencies.
+// Discovery found all dependencies and stored them as Component interfaces, but runner needs
+// concrete *Unit pointers for efficient execution. This function translates between domains.
+func (unitsMap UnitsMap) ConvertDiscoveryToRunner(canonicalTerragruntConfigPaths []string) (Units, error) {
 	units := Units{}
 
 	keys := unitsMap.SortedKeys()
@@ -243,55 +273,6 @@ func (unitsMap UnitsMap) CrossLinkDependencies(canonicalTerragruntConfigPaths []
 	}
 
 	return units, nil
-}
-
-// WriteDot is used to emit a GraphViz compatible definition
-// for a directed graph. It can be used to dump a .dot file.
-// This is a similar implementation to terraform's digraph https://github.com/hashicorp/terraform/blob/v1.5.7/internal/dag/dag.go
-// adding some styling to units that are excluded from the execution in *-all commands
-func (units Units) WriteDot(l log.Logger, w io.Writer, opts *options.TerragruntOptions) error {
-	if _, err := w.Write([]byte("digraph {\n")); err != nil {
-		return errors.New(err)
-	}
-	defer func(w io.Writer, p []byte) {
-		_, err := w.Write(p)
-		if err != nil {
-			l.Warnf("Failed to close graphviz output: %v", err)
-		}
-	}(w, []byte("}\n"))
-
-	// all paths are relative to the TerragruntConfigPath
-	prefix := filepath.Dir(opts.TerragruntConfigPath) + "/"
-
-	for _, source := range units {
-		// apply a different coloring for excluded nodes
-		style := ""
-		if source.FlagExcluded {
-			style = "[color=red]"
-		}
-
-		nodeLine := fmt.Sprintf("\t\"%s\" %s;\n",
-			strings.TrimPrefix(source.Path, prefix), style)
-
-		_, err := w.Write([]byte(nodeLine))
-		if err != nil {
-			return errors.New(err)
-		}
-
-		for _, target := range source.Dependencies {
-			line := fmt.Sprintf("\t\"%s\" -> \"%s\";\n",
-				strings.TrimPrefix(source.Path, prefix),
-				strings.TrimPrefix(target.Path, prefix),
-			)
-
-			_, err := w.Write([]byte(line))
-			if err != nil {
-				return errors.New(err)
-			}
-		}
-	}
-
-	return nil
 }
 
 // CheckForCycles checks for dependency cycles in the given list of units and return an error if one is found.

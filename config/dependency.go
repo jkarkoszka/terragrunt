@@ -28,12 +28,12 @@ import (
 	ctyjson "github.com/zclconf/go-cty/cty/json"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/gruntwork-io/terragrunt/cli/commands/run/creds"
-	"github.com/gruntwork-io/terragrunt/cli/commands/run/creds/providers/amazonsts"
-	"github.com/gruntwork-io/terragrunt/cli/commands/run/creds/providers/externalcmd"
 	"github.com/gruntwork-io/terragrunt/codegen"
 	"github.com/gruntwork-io/terragrunt/config/hclparse"
 	"github.com/gruntwork-io/terragrunt/internal/errors"
+	"github.com/gruntwork-io/terragrunt/internal/runner/run/creds"
+	"github.com/gruntwork-io/terragrunt/internal/runner/run/creds/providers/amazonsts"
+	"github.com/gruntwork-io/terragrunt/internal/runner/run/creds/providers/externalcmd"
 	"github.com/gruntwork-io/terragrunt/options"
 	"github.com/gruntwork-io/terragrunt/tf"
 	"github.com/gruntwork-io/terragrunt/util"
@@ -264,11 +264,6 @@ func decodeDependencies(ctx *ParsingContext, l log.Logger, decodedDependency Ter
 				depCtx := ctx.WithDecodeList(TerragruntFlags).WithTerragruntOptions(depOpts)
 
 				if depConfig, err := PartialParseConfigFile(depCtx, l, depPath, nil); err == nil {
-					if depConfig.Skip != nil && *depConfig.Skip {
-						l.Debugf("Skipping outputs reading for disabled dependency %s", dep.Name)
-						dep.Enabled = new(bool)
-					}
-
 					inputsCty, err := convertToCtyWithJSON(depConfig.Inputs)
 					if err != nil {
 						return nil, err

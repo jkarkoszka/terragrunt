@@ -629,7 +629,7 @@ func getTerraformCliArgs(ctx *ParsingContext, l log.Logger) ([]string, error) {
 	return ctx.TerragruntOptions.TerraformCliArgs, nil
 }
 
-// getDefaultRetryableErrors returns default retryable errors
+// getDefaultRetryableErrors returns default retryable errors for use in errors.retry blocks
 func getDefaultRetryableErrors(ctx *ParsingContext, l log.Logger) ([]string, error) {
 	return options.DefaultRetryableErrors, nil
 }
@@ -1225,7 +1225,7 @@ func ParseAndDecodeVarFile(l log.Logger, opts *options.TerragruntOptions, varFil
 		valMap[attr.Name] = val
 	}
 
-	ctyVal, err := convertValuesMapToCtyVal(valMap)
+	ctyVal, err := ConvertValuesMapToCtyVal(valMap)
 	if err != nil {
 		return err
 	}

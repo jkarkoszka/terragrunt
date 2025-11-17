@@ -3,11 +3,11 @@ package discovery
 
 import (
 	"context"
+	stderrs "errors"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -17,6 +17,7 @@ import (
 	"github.com/gruntwork-io/terragrunt/internal/component"
 	"github.com/gruntwork-io/terragrunt/internal/experiment"
 	"github.com/gruntwork-io/terragrunt/internal/filter"
+	"github.com/gruntwork-io/terragrunt/shell"
 	"github.com/gruntwork-io/terragrunt/util"
 
 	"github.com/gruntwork-io/terragrunt/telemetry"
@@ -49,22 +50,22 @@ const (
 	// converted to a cty value.
 	skipNullValueDiagnostic = "null value"
 
-	// Default number of concurrent workers for discovery operations
+	// defaultDiscoveryWorkers is the default number of concurrent workers for discovery operations
 	defaultDiscoveryWorkers = 4
 
-	// Maximum number of workers (2x default to prevent excessive concurrency)
+	// maxDiscoveryWorkers is the maximum number of workers (2x default to prevent excessive concurrency)
 	maxDiscoveryWorkers = defaultDiscoveryWorkers * 2
 
-	// Channel buffer multiplier for worker pools (larger buffers reduce blocking)
+	// channelBufferMultiplier is the channel buffer multiplier for worker pools (larger buffers reduce blocking)
 	channelBufferMultiplier = 4
 
-	// Maximum hidden directory memoization entries (prevents unbounded memory growth)
+	// maxHiddenDirMemoSize is the maximum number of hidden directory memoization entries (prevents unbounded memory growth)
 	maxHiddenDirMemoSize = 1000
 
-	// Default maximum dependency depth for discovery
+	// defaultMaxDependencyDepth is the default maximum dependency depth for discovery
 	defaultMaxDependencyDepth = 1000
 
-	// Maximum number of cycle removal attempts (prevents infinite loops)
+	// maxCycleRemovalAttempts is the maximum number of cycle removal attempts (prevents infinite loops)
 	maxCycleRemovalAttempts = 100
 )
 
@@ -110,6 +111,12 @@ type Discovery struct {
 	// filters contains filter queries for component selection
 	filters filter.Filters
 
+	// dependencyTargetExpressions contains target expressions from graph filters that require dependency discovery
+	dependencyTargetExpressions []filter.Expression
+
+	// dependentTargetExpressions contains target expressions from graph filters that require dependent discovery
+	dependentTargetExpressions []filter.Expression
+
 	// hiddenDirMemo is a memoization of hidden directories.
 	hiddenDirMemo hiddenDirMemo
 
@@ -125,11 +132,8 @@ type Discovery struct {
 	// excludeByDefault determines whether to exclude configurations by default (triggered by include flags).
 	excludeByDefault bool
 
-	// ignoreExternalDependencies determines whether to drop dependencies that are outside the working directory.
-	ignoreExternalDependencies bool
-
-	// hidden determines whether to detect configurations in hidden directories.
-	hidden bool
+	// noHidden determines whether to detect configurations in noHidden directories.
+	noHidden bool
 
 	// requiresParse is true when the discovery requires parsing Terragrunt configurations.
 	requiresParse bool
@@ -154,6 +158,12 @@ type Discovery struct {
 
 	// useDefaultExcludes determines whether to use default exclude patterns.
 	useDefaultExcludes bool
+
+	// filterFlagEnabled determines whether the filter flag experiment is active
+	filterFlagEnabled bool
+
+	// breakCycles determines whether to break cycles in the dependency graph if any exist.
+	breakCycles bool
 }
 
 // DiscoveryOption is a function that modifies a Discovery.
@@ -168,31 +178,9 @@ type CompiledPattern struct {
 // DefaultConfigFilenames are the default Terragrunt config filenames used in discovery.
 var DefaultConfigFilenames = []string{config.DefaultTerragruntConfigPath, config.DefaultStackFile}
 
-// NewDiscovery creates a new Discovery.
-func NewDiscovery(dir string, opts ...DiscoveryOption) *Discovery {
-	numWorkers := max(min(runtime.NumCPU(), maxDiscoveryWorkers), defaultDiscoveryWorkers)
-
-	discovery := &Discovery{
-		workingDir: dir,
-		hidden:     false,
-		includeDirs: []string{
-			config.StackDir,
-			filepath.Join(config.StackDir, "**"),
-		},
-		numWorkers:         numWorkers,
-		useDefaultExcludes: true,
-	}
-
-	for _, opt := range opts {
-		opt(discovery)
-	}
-
-	return discovery
-}
-
-// WithHidden sets the Hidden flag to true.
-func (d *Discovery) WithHidden() *Discovery {
-	d.hidden = true
+// WithNoHidden sets the Hidden flag to true.
+func (d *Discovery) WithNoHidden() *Discovery {
+	d.noHidden = true
 
 	return d
 }
@@ -342,12 +330,6 @@ func (d *Discovery) WithExcludeByDefault() *Discovery {
 	return d
 }
 
-// WithIgnoreExternalDependencies drops dependencies outside of the working directory.
-func (d *Discovery) WithIgnoreExternalDependencies() *Discovery {
-	d.ignoreExternalDependencies = true
-	return d
-}
-
 // WithNumWorkers sets the number of concurrent workers for discovery operations.
 func (d *Discovery) WithNumWorkers(numWorkers int) *Discovery {
 	d.numWorkers = numWorkers
@@ -362,8 +344,48 @@ func (d *Discovery) WithoutDefaultExcludes() *Discovery {
 
 // WithFilters sets filter queries for component selection.
 // When filters are set, only components matching the filters will be included.
+//
+// WithFilters also determines whether certain aspects of the discovery configuration allows for optimizations or
+// adjustments to discovery are required. e.g. exclude by default if there are any positive filters.
 func (d *Discovery) WithFilters(filters filter.Filters) *Discovery {
 	d.filters = filters
+
+	d.WithFilterFlagEnabled()
+
+	// If there are any positive filters, we need to exclude by default,
+	// and only include components if they match filters.
+	if d.filters.HasPositiveFilter() {
+		d.WithExcludeByDefault()
+	}
+
+	// Collect target expressions from graph filters for selective graph traversal.
+	d.dependencyTargetExpressions = d.filters.RequiresDependencyDiscovery()
+	d.dependentTargetExpressions = d.filters.RequiresDependentDiscovery()
+
+	// When working with graph filters, we always perform discovery of components,
+	// regardless of whether or not they are external. We can filter them out after the fact if necessary.
+	if len(d.dependencyTargetExpressions) > 0 || len(d.dependentTargetExpressions) > 0 {
+		d.discoverExternalDependencies = true
+	}
+
+	// If any filters require parsing, we need to opt-in to parsing.
+	if _, ok := d.filters.RequiresParse(); ok {
+		d.WithRequiresParse()
+	}
+
+	return d
+}
+
+// WithFilterFlagEnabled sets whether the filter flag experiment is enabled.
+// This changes how discovery processes components during file traversal.
+func (d *Discovery) WithFilterFlagEnabled() *Discovery {
+	d.filterFlagEnabled = true
+	return d
+}
+
+// WithBreakCycles sets the BreakCycles flag to true.
+func (d *Discovery) WithBreakCycles() *Discovery {
+	d.breakCycles = true
 	return d
 }
 
@@ -429,34 +451,49 @@ func Parse(
 	parserOptions []hclparse.Option,
 ) error {
 	parseOpts := opts.Clone()
-	parseOpts.WorkingDir = c.Path()
+
+	// Determine working directory and config filename, supporting file paths and stack kind
+	componentPath := c.Path()
+
+	var workingDir, configFilename string
+
+	// Defaults assume a directory path
+	workingDir = componentPath
+	configFilename = config.DefaultTerragruntConfigPath
+
+	// If the path points directly to a file, split dir and filename
+	if util.FileExists(componentPath) && !util.IsDir(componentPath) {
+		workingDir = filepath.Dir(componentPath)
+		configFilename = filepath.Base(componentPath)
+	} else {
+		// Allow user-specified config filename when provided as a file path
+		if p := opts.TerragruntConfigPath; p != "" && !util.IsDir(p) {
+			configFilename = filepath.Base(p)
+		}
+		// Stacks always use the default stack filename
+		if c.Kind() == component.StackKind {
+			configFilename = config.DefaultStackFile
+		}
+	}
+
+	parseOpts.WorkingDir = workingDir
 
 	// Suppress logging to avoid cluttering the output.
 	parseOpts.Writer = io.Discard
 	parseOpts.ErrWriter = io.Discard
 	parseOpts.SkipOutput = true
 
-	// If the user provided a specific terragrunt config path and it is not a directory,
-	// use its base name as the file to parse. This allows users to run terragrunt with
-	// a specific config file instead of the default terragrunt.hcl.
-	// Otherwise, use the default terragrunt.hcl filename.
-	filename := config.DefaultTerragruntConfigPath
-	if opts.TerragruntConfigPath != "" && !util.IsDir(opts.TerragruntConfigPath) {
-		filename = filepath.Base(opts.TerragruntConfigPath)
-	}
-
-	// For stack configurations, always use the default stack config filename
-	if _, ok := c.(*component.Stack); ok {
-		filename = config.DefaultStackFile
-	}
-
-	parseOpts.TerragruntConfigPath = filepath.Join(parseOpts.WorkingDir, filename)
+	parseOpts.TerragruntConfigPath = filepath.Join(parseOpts.WorkingDir, configFilename)
+	parseOpts.OriginalTerragruntConfigPath = parseOpts.TerragruntConfigPath
 
 	parsingCtx := config.NewParsingContext(ctx, l, parseOpts).WithDecodeList(
+		config.TerraformSource,
 		config.DependenciesBlock,
 		config.DependencyBlock,
+		config.TerragruntFlags,
 		config.FeatureFlagsBlock,
 		config.ExcludeBlock,
+		config.ErrorsBlock,
 	).WithSkipOutputsResolution()
 
 	// Apply custom parser options if provided via discovery
@@ -505,15 +542,24 @@ func Parse(
 
 	// Set a list with partial blocks used to do discovery
 	parsingCtx = parsingCtx.WithDecodeList(
+		config.TerraformSource,
 		config.DependenciesBlock,
 		config.DependencyBlock,
+		config.TerragruntFlags,
 		config.FeatureFlagsBlock,
 		config.ExcludeBlock,
+		config.ErrorsBlock,
 	)
 
 	//nolint: contextcheck
 	cfg, err = config.PartialParseConfigFile(parsingCtx, l, parseOpts.TerragruntConfigPath, nil)
 	if err != nil {
+		// Treat include-only/no-settings configs as non-fatal during discovery when suppression is enabled
+		if suppressParseErrors && containsNoSettingsError(err) {
+			l.Debugf("Skipping include-only config during discovery: %s", parseOpts.TerragruntConfigPath)
+			return nil
+		}
+
 		if !suppressParseErrors || cfg == nil {
 			l.Debugf("Unrecoverable parse error for %s: %s", parseOpts.TerragruntConfigPath, err)
 
@@ -551,9 +597,8 @@ func (d *Discovery) isInHiddenDirectory(path string) bool {
 	}
 
 	hiddenPath := ""
-	parts := strings.SplitSeq(path, string(os.PathSeparator))
 
-	for part := range parts {
+	for part := range strings.SplitSeq(path, string(os.PathSeparator)) {
 		if hiddenPath != "" {
 			hiddenPath = filepath.Join(hiddenPath, part)
 		} else {
@@ -601,17 +646,17 @@ func (d *Discovery) discoverConcurrently(
 		_ = g.Wait() // We handle errors in the main thread below
 	}()
 
-	cfgs := make(component.Components, 0, len(results))
+	components := make(component.Components, 0, len(results))
 
 	for config := range results {
-		cfgs = append(cfgs, config)
+		components = append(components, config)
 	}
 
 	if err := g.Wait(); err != nil {
-		return cfgs, err
+		return components, err
 	}
 
-	return cfgs, nil
+	return components, nil
 }
 
 // walkDirectoryConcurrently walks the directory tree and sends file paths to workers.
@@ -638,7 +683,7 @@ func (d *Discovery) walkDirectoryConcurrently(
 		}
 
 		if info.IsDir() {
-			return d.shouldSkipDirectory(path, l)
+			return d.skipDirIfIgnorable(l, path)
 		}
 
 		select {
@@ -653,13 +698,22 @@ func (d *Discovery) walkDirectoryConcurrently(
 	return walkFn(d.workingDir, processFn)
 }
 
-// shouldSkipDirectory determines if a directory should be skipped during traversal.
-func (d *Discovery) shouldSkipDirectory(path string, l log.Logger) error {
-	base := filepath.Base(path)
+// skipDirIfIgnorable determines if a directory should be skipped during traversal.
+func (d *Discovery) skipDirIfIgnorable(l log.Logger, path string) error {
+	if err := skipDirIfIgnorable(path); err != nil {
+		return err
+	}
 
-	switch base {
-	case ".git", ".terraform", ".terragrunt-cache":
-		return filepath.SkipDir
+	if d.noHidden {
+		base := filepath.Base(path)
+		if strings.HasPrefix(base, ".") && base != "." && base != ".." {
+			return filepath.SkipDir
+		}
+	}
+
+	// When the filter flag is enabled, let the filters control discovery instead of exclude patterns
+	if d.filterFlagEnabled {
+		return nil
 	}
 
 	canonicalDir, canErr := util.CanonicalPath(path, d.workingDir)
@@ -673,6 +727,20 @@ func (d *Discovery) shouldSkipDirectory(path string, l log.Logger) error {
 	}
 
 	return nil
+}
+
+// isInStackDirectory checks if the given clean directory path contains the stack directory.
+//
+// This function assumes that the path will be normalized for forward slashes before being
+// passed in.
+func isInStackDirectory(cleanDir string) bool {
+	for part := range strings.SplitSeq(cleanDir, "/") {
+		if part == config.StackDir {
+			return true
+		}
+	}
+
+	return false
 }
 
 // configWorker processes file paths and determines if they are Terragrunt configurations.
@@ -710,12 +778,52 @@ func (d *Discovery) processFile(path string, l log.Logger, filenames []string) c
 
 	canonicalDir, canErr := util.CanonicalPath(dir, d.workingDir)
 	if canErr == nil {
-		for _, pattern := range d.compiledExcludePatterns {
-			if pattern.Compiled.Match(canonicalDir) {
-				l.Debugf("Path %s excluded by glob %s", canonicalDir, pattern.Original)
-				return nil
+		// Eventually, this is going to be removed entirely, as filter evaluation
+		// will be all that's needed.
+		if !d.filterFlagEnabled {
+			for _, pattern := range d.compiledExcludePatterns {
+				if pattern.Compiled.Match(canonicalDir) {
+					l.Debugf("Path %s excluded by glob %s", canonicalDir, pattern.Original)
+					return nil
+				}
 			}
 		}
+
+		if d.filterFlagEnabled {
+			c := d.createComponentFromPath(path, filenames)
+			if c == nil {
+				return nil
+			}
+
+			// Check for hidden directories before returning
+			if d.noHidden && d.isInHiddenDirectory(path) {
+				// Always allow .terragrunt-stack contents
+				cleanDir := util.CleanPath(canonicalDir)
+				if !isInStackDirectory(cleanDir) {
+					return nil
+				}
+			}
+
+			shouldEvaluateFiltersNow := !d.discoverDependencies
+			if shouldEvaluateFiltersNow {
+				if _, requiresParsing := d.filters.RequiresDiscovery(); !requiresParsing {
+					filtered, err := d.filters.Evaluate(l, component.Components{c})
+					if err != nil {
+						l.Debugf("Error evaluating filters for %s: %v", c.Path(), err)
+						return nil
+					}
+
+					if len(filtered) == 0 {
+						return nil
+					}
+				}
+			}
+
+			return c
+		}
+
+		// Everything after this point is only relevant when the filter flag is disabled.
+		// It should be removed once the filter flag is generally available.
 
 		// Enforce include patterns only when strictInclude or excludeByDefault are set
 		if d.strictInclude || d.excludeByDefault {
@@ -735,16 +843,14 @@ func (d *Discovery) processFile(path string, l log.Logger, filenames []string) c
 	}
 
 	// Now enforce hidden directory check if still applicable
-	if !d.hidden && d.isInHiddenDirectory(path) {
+	if d.noHidden && d.isInHiddenDirectory(path) {
 		// If the directory is hidden, allow it only if it matches an include pattern
 		allowHidden := false
 
 		if canErr == nil {
 			// Always allow .terragrunt-stack contents
 			cleanDir := util.CleanPath(canonicalDir)
-			if strings.Contains(cleanDir, "/"+config.StackDir+"/") || strings.HasSuffix(cleanDir, "/"+config.StackDir) {
-				allowHidden = true
-			}
+			allowHidden = isInStackDirectory(cleanDir)
 
 			if !allowHidden {
 				// Use precompiled patterns for include matching in hidden directory check
@@ -762,22 +868,35 @@ func (d *Discovery) processFile(path string, l log.Logger, filenames []string) c
 		}
 	}
 
+	return d.createComponentFromPath(path, filenames)
+}
+
+// createComponentFromPath creates a component from a file path if it matches one of the config filenames.
+// Returns nil if the file doesn't match any of the provided filenames.
+func (d *Discovery) createComponentFromPath(path string, filenames []string) component.Component {
 	base := filepath.Base(path)
-	for _, fname := range filenames {
-		if base == fname {
-			var cfg component.Component
-			if fname == config.DefaultStackFile {
-				cfg = component.NewStack(filepath.Dir(path))
-			} else {
-				cfg = component.NewUnit(filepath.Dir(path))
-			}
+	dir := filepath.Dir(path)
 
-			if d.discoveryContext != nil {
-				cfg.SetDiscoveryContext(d.discoveryContext)
-			}
-
-			return cfg
+	componentOfBase := func(dir, base string) component.Component {
+		if base == config.DefaultStackFile {
+			return component.NewStack(dir)
 		}
+
+		return component.NewUnit(dir)
+	}
+
+	for _, fname := range filenames {
+		if base != fname {
+			continue
+		}
+
+		c := componentOfBase(dir, base)
+
+		if d.discoveryContext != nil {
+			c.SetDiscoveryContext(d.discoveryContext)
+		}
+
+		return c
 	}
 
 	return nil
@@ -869,7 +988,7 @@ func (d *Discovery) parseWorker(
 	componentChan <-chan component.Component,
 	errorChan chan<- error,
 ) error {
-	for cfg := range componentChan {
+	for c := range componentChan {
 		// Context cancellation check
 		select {
 		case <-ctx.Done():
@@ -877,7 +996,7 @@ func (d *Discovery) parseWorker(
 		default:
 		}
 
-		err := Parse(cfg, ctx, l, opts, d.suppressParseErrors, d.parserOptions)
+		err := Parse(c, ctx, l, opts, d.suppressParseErrors, d.parserOptions)
 
 		// Send error or handle context cancellation
 		select {
@@ -957,61 +1076,141 @@ func (d *Discovery) Discover(
 		errs = append(errs, parseErrs...)
 	}
 
-	// Apply filters if configured and not doing dependency discovery
-	// When dependency discovery is enabled, we defer filtering until after dependencies are discovered
-	if len(d.filters) > 0 && !d.discoverDependencies {
-		filtered, err := d.filters.Evaluate(components)
-		if err != nil {
-			errs = append(errs, errors.New(err))
-		} else {
-			components = filtered
-		}
+	dependencyStartingComponents, err := d.determineDependencyStartingComponents(l, components)
+	if err != nil {
+		errs = append(errs, err)
 	}
 
-	if d.discoverDependencies {
-		err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "discover_dependencies", map[string]any{
-			"working_dir":                    d.workingDir,
-			"config_count":                   len(components),
-			"discover_external_dependencies": d.discoverExternalDependencies,
-			"max_dependency_depth":           d.maxDependencyDepth,
-		}, func(ctx context.Context) error {
-			dependencyDiscovery := NewDependencyDiscovery(components, d.maxDependencyDepth)
+	dependentStartingComponents, err := d.determineDependentStartingComponents(l, components)
+	if err != nil {
+		errs = append(errs, err)
+	}
 
-			if d.discoveryContext != nil {
-				dependencyDiscovery = dependencyDiscovery.WithDiscoveryContext(d.discoveryContext)
-			}
+	var threadSafeComponents *component.ThreadSafeComponents
 
-			if d.discoverExternalDependencies {
-				dependencyDiscovery = dependencyDiscovery.WithDiscoverExternalDependencies()
-			}
+	shouldRunDependencyDiscovery := len(dependencyStartingComponents) > 0
+	shouldRunDependentDiscovery := len(dependentStartingComponents) > 0
 
-			if d.ignoreExternalDependencies {
-				dependencyDiscovery = dependencyDiscovery.WithIgnoreExternal()
-			}
+	if shouldRunDependencyDiscovery || shouldRunDependentDiscovery {
+		threadSafeComponents = component.NewThreadSafeComponents(components)
 
-			if d.suppressParseErrors {
-				dependencyDiscovery = dependencyDiscovery.WithSuppressParseErrors()
-			}
+		// Run dependency and dependent discovery concurrently.
+		g, discoveryCtx := errgroup.WithContext(ctx)
+		g.SetLimit(2) //nolint:mnd
 
-			// pass parser options
-			if len(d.parserOptions) > 0 {
-				dependencyDiscovery = dependencyDiscovery.WithParserOptions(d.parserOptions)
-			}
+		if shouldRunDependencyDiscovery {
+			g.Go(func() error {
+				return telemetry.TelemeterFromContext(ctx).Collect(ctx, "discover_dependencies", map[string]any{
+					"working_dir":                    d.workingDir,
+					"config_count":                   len(components),
+					"starting_component_count":       len(dependencyStartingComponents),
+					"discover_external_dependencies": d.discoverExternalDependencies,
+					"max_dependency_depth":           d.maxDependencyDepth,
+				}, func(ctx context.Context) error {
+					dependencyDiscovery := NewDependencyDiscovery(threadSafeComponents).
+						WithMaxDepth(d.maxDependencyDepth).
+						WithWorkingDir(d.workingDir).
+						WithNumWorkers(d.numWorkers)
 
-			err := dependencyDiscovery.DiscoverAllDependencies(ctx, l, opts)
-			if err != nil {
-				l.Warnf("Parsing errors where encountered while discovering dependencies. They were suppressed, and can be found in the debug logs.")
+					if d.discoveryContext != nil {
+						dependencyDiscovery = dependencyDiscovery.WithDiscoveryContext(d.discoveryContext)
+					}
 
-				l.Debugf("Errors: %w", err)
-			}
+					if d.discoverExternalDependencies {
+						dependencyDiscovery = dependencyDiscovery.WithDiscoverExternalDependencies()
+					}
 
-			components = dependencyDiscovery.components
+					if d.suppressParseErrors {
+						dependencyDiscovery = dependencyDiscovery.WithSuppressParseErrors()
+					}
 
-			return nil
-		})
-		if err != nil {
-			return components, errors.New(err)
+					// pass parser options
+					if len(d.parserOptions) > 0 {
+						dependencyDiscovery = dependencyDiscovery.WithParserOptions(d.parserOptions)
+					}
+
+					discoveryErr := dependencyDiscovery.DiscoverAllDependencies(discoveryCtx, l, opts, dependencyStartingComponents)
+					if discoveryErr != nil {
+						if !d.suppressParseErrors {
+							return discoveryErr
+						}
+
+						l.Warnf("Parsing errors where encountered while discovering dependencies. They were suppressed, and can be found in the debug logs.")
+
+						l.Debugf("Errors: %v", discoveryErr)
+					}
+
+					return nil
+				})
+			})
 		}
+
+		if shouldRunDependentDiscovery {
+			g.Go(func() error {
+				return telemetry.TelemeterFromContext(ctx).Collect(ctx, "discover_dependents", map[string]any{
+					"working_dir":              d.workingDir,
+					"config_count":             len(components),
+					"starting_component_count": len(dependentStartingComponents),
+					"max_dependency_depth":     d.maxDependencyDepth,
+				}, func(ctx context.Context) error {
+					dependentDiscovery := NewDependentDiscovery(threadSafeComponents).
+						WithMaxDepth(d.maxDependencyDepth).
+						WithWorkingDir(d.workingDir).
+						WithNumWorkers(d.numWorkers)
+
+					if d.discoveryContext != nil {
+						dependentDiscovery = dependentDiscovery.WithDiscoveryContext(d.discoveryContext)
+					}
+
+					if d.suppressParseErrors {
+						dependentDiscovery = dependentDiscovery.WithSuppressParseErrors()
+					}
+
+					if d.discoverExternalDependencies {
+						dependentDiscovery = dependentDiscovery.WithDiscoverExternalDependencies()
+					}
+
+					// pass parser options
+					if len(d.parserOptions) > 0 {
+						dependentDiscovery = dependentDiscovery.WithParserOptions(d.parserOptions)
+					}
+
+					// Set runtime values before discovery
+					dependentDiscovery = dependentDiscovery.WithOpts(opts)
+
+					if len(d.configFilenames) > 0 {
+						dependentDiscovery = dependentDiscovery.WithFilenames(d.configFilenames)
+					}
+
+					// Compute git root if we have starting components
+					if len(dependentStartingComponents) > 0 {
+						startingPath := dependentStartingComponents[0].Path()
+						if gitRootPath, gitErr := shell.GitTopLevelDir(discoveryCtx, l, opts, startingPath); gitErr == nil {
+							dependentDiscovery = dependentDiscovery.WithGitRoot(gitRootPath)
+						}
+					}
+
+					discoveryErr := dependentDiscovery.DiscoverAllDependents(discoveryCtx, l, dependentStartingComponents)
+					if discoveryErr != nil {
+						if !d.suppressParseErrors {
+							return discoveryErr
+						}
+
+						l.Warnf("Parsing errors where encountered while discovering dependents. They were suppressed, and can be found in the debug logs.")
+
+						l.Debugf("Errors: %w", discoveryErr)
+					}
+
+					return nil
+				})
+			})
+		}
+
+		if discoveryGroupErr := g.Wait(); discoveryGroupErr != nil {
+			return components, errors.New(discoveryGroupErr)
+		}
+
+		components = threadSafeComponents.ToComponents()
 
 		err = telemetry.TelemeterFromContext(ctx).Collect(ctx, "discovery_cycle_check", map[string]any{
 			"working_dir":  d.workingDir,
@@ -1024,9 +1223,11 @@ func (d *Discovery) Discover(
 
 				var removeErr error
 
-				components, removeErr = RemoveCycles(components)
-				if removeErr != nil {
-					errs = append(errs, errors.New(removeErr))
+				if d.breakCycles {
+					components, removeErr = RemoveCycles(components)
+					if removeErr != nil {
+						errs = append(errs, errors.New(removeErr))
+					}
 				}
 			}
 
@@ -1037,13 +1238,33 @@ func (d *Discovery) Discover(
 		}
 	}
 
-	// Apply filters at the end if dependency discovery was enabled
-	if len(d.filters) > 0 && d.discoverDependencies {
-		filtered, err := d.filters.Evaluate(components)
+	if len(d.filters) > 0 {
+		filtered, evaluateErr := d.filters.Evaluate(l, components)
+		if evaluateErr != nil {
+			errs = append(errs, errors.New(evaluateErr))
+		}
+
+		components = filtered
+	}
+
+	if d.filterFlagEnabled && d.discoverDependencies {
+		relationshipDiscovery := NewRelationshipDiscovery(&components).
+			WithMaxDepth(d.maxDependencyDepth).
+			WithNumWorkers(d.numWorkers)
+
+		if len(d.parserOptions) > 0 {
+			relationshipDiscovery = relationshipDiscovery.WithParserOptions(d.parserOptions)
+		}
+
+		err = relationshipDiscovery.DiscoverAllRelationships(ctx, l, opts, components)
 		if err != nil {
-			errs = append(errs, errors.New(err))
-		} else {
-			components = filtered
+			if !d.suppressParseErrors {
+				errs = append(errs, errors.New(err))
+			} else {
+				l.Warnf("Parsing errors where encountered while discovering relationships. They were suppressed, and can be found in the debug logs.")
+
+				l.Debugf("Errors: %w", err)
+			}
 		}
 	}
 
@@ -1054,229 +1275,166 @@ func (d *Discovery) Discover(
 	return components, nil
 }
 
-// DependencyDiscovery is the configuration for a DependencyDiscovery.
-type DependencyDiscovery struct {
-	discoveryContext    *component.DiscoveryContext
-	components          component.Components
-	parserOptions       []hclparse.Option
-	depthRemaining      int
-	discoverExternal    bool
-	suppressParseErrors bool
-	ignoreExternal      bool
-}
+// determineDependencyStartingComponents determines the starting components for dependency discovery.
+// It uses filter expressions if provided, otherwise returns all components if dependency discovery is enabled.
+func (d *Discovery) determineDependencyStartingComponents(
+	l log.Logger,
+	components component.Components,
+) (component.Components, error) {
+	var (
+		startingComponents component.Components
+		errs               []error
+	)
 
-// DependencyDiscoveryOption is a function that modifies a DependencyDiscovery.
-type DependencyDiscoveryOption func(*DependencyDiscovery)
+	// In the legacy discovery path, it's a binary all or nothing.
+	if !d.filterFlagEnabled {
+		if d.discoverDependencies {
+			return components, nil
+		}
 
-func NewDependencyDiscovery(components component.Components, depthRemaining int) *DependencyDiscovery {
-	return &DependencyDiscovery{
-		components:     components,
-		depthRemaining: depthRemaining,
+		return startingComponents, nil
 	}
-}
 
-// WithSuppressParseErrors sets the SuppressParseErrors flag to true.
-func (d *DependencyDiscovery) WithSuppressParseErrors() *DependencyDiscovery {
-	d.suppressParseErrors = true
+	// In the filter flag enabled path:
+	// - If we have dependency target expressions, use them to determine starting components
+	// - If we don't have dependency target expressions but discoverDependencies is enabled,
+	//   use all components as starting points (to discover dependencies of all components)
+	if len(d.dependencyTargetExpressions) == 0 {
+		return startingComponents, nil
+	}
 
-	return d
-}
+	seenPaths := make(map[string]struct{})
 
-// WithDiscoverExternalDependencies sets the DiscoverExternalDependencies flag to true.
-func (d *DependencyDiscovery) WithDiscoverExternalDependencies() *DependencyDiscovery {
-	d.discoverExternal = true
-
-	return d
-}
-
-// WithIgnoreExternal drops dependencies outside the working directory.
-func (d *DependencyDiscovery) WithIgnoreExternal() *DependencyDiscovery {
-	d.ignoreExternal = true
-	return d
-}
-
-// WithParserOptions sets custom HCL parser options for dependency discovery.
-func (d *DependencyDiscovery) WithParserOptions(options []hclparse.Option) *DependencyDiscovery {
-	d.parserOptions = options
-	return d
-}
-
-func (d *DependencyDiscovery) WithDiscoveryContext(discoveryContext *component.DiscoveryContext) *DependencyDiscovery {
-	d.discoveryContext = discoveryContext
-
-	return d
-}
-
-func (d *DependencyDiscovery) DiscoverAllDependencies(ctx context.Context, l log.Logger, opts *options.TerragruntOptions) error {
-	errs := []error{}
-
-	for _, cfg := range d.components {
-		if _, ok := cfg.(*component.Stack); ok {
+	for _, targetExpr := range d.dependencyTargetExpressions {
+		matched, err := filter.Evaluate(l, targetExpr, components)
+		if err != nil {
+			errs = append(errs, errors.New(err))
 			continue
 		}
 
-		err := d.DiscoverDependencies(ctx, l, opts, cfg)
-		if err != nil {
-			errs = append(errs, errors.New(err))
+		for _, c := range matched {
+			path := c.Path()
+			if _, seen := seenPaths[path]; !seen {
+				startingComponents = append(startingComponents, c)
+				seenPaths[path] = struct{}{}
+			}
 		}
 	}
 
 	if len(errs) > 0 {
-		return errors.Join(errs...)
+		return startingComponents, errors.Join(errs...)
 	}
 
-	return nil
+	return startingComponents, nil
 }
 
-func (d *DependencyDiscovery) DiscoverDependencies(
-	ctx context.Context,
+// determineDependentStartingComponents determines the starting components for dependent discovery.
+// It uses filter expressions to determine which components should be used as starting points.
+func (d *Discovery) determineDependentStartingComponents(
 	l log.Logger,
-	opts *options.TerragruntOptions,
-	dComponent component.Component,
-) error {
-	if d.depthRemaining <= 0 {
-		return errors.New("max dependency depth reached while discovering dependencies")
+	components component.Components,
+) (component.Components, error) {
+	var (
+		startingComponents component.Components
+		errs               []error
+	)
+
+	// If there are no dependent target expressions, return empty starting components
+	if len(d.dependentTargetExpressions) == 0 {
+		return startingComponents, nil
 	}
 
-	d.depthRemaining--
+	seenPaths := make(map[string]struct{})
 
-	defer func() { d.depthRemaining++ }()
-
-	// Stack configs don't have dependencies (at least for now),
-	// so we can return early.
-	if _, ok := dComponent.(*component.Stack); ok {
-		return nil
-	}
-
-	unit, ok := dComponent.(*component.Unit)
-	if !ok {
-		return errors.New("expected Unit component but got different type")
-	}
-
-	// This should only happen if we're discovering an ancestor dependency.
-	if unit.Config() == nil {
-		err := Parse(dComponent, ctx, l, opts, d.suppressParseErrors, d.parserOptions)
+	for _, targetExpr := range d.dependentTargetExpressions {
+		matched, err := filter.Evaluate(l, targetExpr, components)
 		if err != nil {
-			return errors.New(err)
+			errs = append(errs, errors.New(err))
+			continue
+		}
+
+		for _, c := range matched {
+			path := c.Path()
+			if _, seen := seenPaths[path]; !seen {
+				startingComponents = append(startingComponents, c)
+				seenPaths[path] = struct{}{}
+			}
 		}
 	}
 
-	terragruntCfg := unit.Config()
-	dependencyBlocks := terragruntCfg.TerragruntDependencies
+	if len(errs) > 0 {
+		return startingComponents, errors.Join(errs...)
+	}
 
-	depPaths := make([]string, 0, len(dependencyBlocks))
+	return startingComponents, nil
+}
 
-	errs := []error{}
+// extractDependencyPaths extracts all dependency paths from a Terragrunt configuration.
+// It returns the list of absolute dependency paths and any errors encountered during extraction.
+func extractDependencyPaths(cfg *config.TerragruntConfig, component component.Component) ([]string, error) {
+	deduped := make(map[string]struct{})
 
-	for _, dependency := range dependencyBlocks {
+	var errs []error
+
+	for _, dependency := range cfg.TerragruntDependencies {
 		if dependency.ConfigPath.Type() != cty.String {
 			errs = append(errs, errors.New("dependency config path is not a string"))
-
 			continue
 		}
 
 		depPath := dependency.ConfigPath.AsString()
-
 		if !filepath.IsAbs(depPath) {
-			depPath = filepath.Join(dComponent.Path(), depPath)
+			depPath = filepath.Clean(filepath.Join(component.Path(), depPath))
 		}
 
-		depPaths = append(depPaths, depPath)
-	}
-
-	if terragruntCfg.Dependencies != nil {
-		for _, dependency := range terragruntCfg.Dependencies.Paths {
-			if !filepath.IsAbs(dependency) {
-				dependency = filepath.Join(dComponent.Path(), dependency)
-			}
-
-			depPaths = append(depPaths, dependency)
-		}
-	}
-
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-
-	if len(depPaths) == 0 {
-		return nil
-	}
-
-	deduped := make(map[string]struct{}, len(depPaths))
-
-	for _, depPath := range depPaths {
 		deduped[depPath] = struct{}{}
 	}
 
+	if cfg.Dependencies != nil {
+		for _, dependency := range cfg.Dependencies.Paths {
+			if !filepath.IsAbs(dependency) {
+				dependency = filepath.Clean(filepath.Join(component.Path(), dependency))
+			}
+
+			deduped[dependency] = struct{}{}
+		}
+	}
+
+	depPaths := make([]string, 0, len(deduped))
 	for depPath := range deduped {
-		external := true
-
-		for _, c := range d.components {
-			if c.Path() == depPath {
-				external = false
-
-				dComponent.AddDependency(c)
-
-				continue
-			}
-		}
-
-		if external {
-			// Skip external if requested
-			if d.ignoreExternal {
-				continue
-			}
-
-			ext := component.NewUnit(depPath)
-			ext.SetExternal()
-
-			if d.discoveryContext != nil {
-				ext.SetDiscoveryContext(d.discoveryContext)
-			}
-
-			dComponent.AddDependency(ext)
-
-			if d.discoverExternal {
-				d.components = append(d.components, ext)
-
-				err := d.DiscoverDependencies(ctx, l, opts, ext)
-				if err != nil {
-					errs = append(errs, errors.New(err))
-				}
-			}
-		}
+		depPaths = append(depPaths, depPath)
 	}
 
 	if len(errs) > 0 {
-		return errors.Join(errs...)
+		return depPaths, errors.Join(errs...)
 	}
 
-	return nil
+	return depPaths, nil
 }
 
 // RemoveCycles removes cycles from the dependency graph.
-func RemoveCycles(c component.Components) (component.Components, error) {
+func RemoveCycles(components component.Components) (component.Components, error) {
 	var (
 		err error
-		cfg component.Component
+		c   component.Component
 	)
 
 	for range maxCycleRemovalAttempts {
-		if cfg, err = c.CycleCheck(); err == nil {
+		if c, err = components.CycleCheck(); err == nil {
 			break
 		}
 
 		// Cfg should never be nil if err is not nil,
 		// but we do this check to avoid a nil pointer dereference
 		// if our assumptions change in the future.
-		if cfg == nil {
+		if c == nil {
 			break
 		}
 
-		c = c.RemoveByPath(cfg.Path())
+		components = components.RemoveByPath(c.Path())
 	}
 
-	return c, err
+	return components, err
 }
 
 // hiddenDirMemo provides thread-safe memoization of hidden directories.
@@ -1302,6 +1460,69 @@ func (h *hiddenDirMemo) contains(path string) bool {
 
 	for _, hiddenDir := range h.entries {
 		if strings.HasPrefix(path, hiddenDir) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// skipDirIfIgnorable checks if an entire directory should be skipped based on the fact that it's
+// in a directory that should never have components discovered in it.
+func skipDirIfIgnorable(path string) error {
+	base := filepath.Base(path)
+
+	switch base {
+	case ".git", ".terraform", ".terragrunt-cache":
+		return filepath.SkipDir
+	}
+
+	return nil
+}
+
+// isExternal checks if a component path is outside the given working directory.
+// A path is considered external if it's not within or equal to the working directory.
+// We conservatively evaluate paths as external if we cannot determine their absolute path.
+func isExternal(workingDir string, componentPath string) bool {
+	if workingDir == "" {
+		return true
+	}
+
+	workingDirAbs, err := filepath.Abs(workingDir)
+	if err != nil {
+		return true
+	}
+
+	componentPathAbs, err := filepath.Abs(componentPath)
+	if err != nil {
+		return true
+	}
+
+	workingDirResolved, err := filepath.EvalSymlinks(workingDirAbs)
+	if err != nil {
+		workingDirResolved = workingDirAbs
+	}
+
+	componentPathResolved, err := filepath.EvalSymlinks(componentPathAbs)
+	if err != nil {
+		componentPathResolved = componentPathAbs
+	}
+
+	relPath, err := filepath.Rel(workingDirResolved, componentPathResolved)
+	if err != nil {
+		return true
+	}
+
+	return strings.HasPrefix(relPath, "..")
+}
+
+// containsNoSettingsError returns true if the provided error (possibly a joined/wrapped error)
+// contains a config-level error indicating there were no Terragrunt configuration settings
+// (e.g., include-only file) that should be treated as non-fatal during discovery.
+func containsNoSettingsError(err error) bool {
+	for _, e := range errors.UnwrapErrors(err) {
+		var target config.CouldNotResolveTerragruntConfigInFileError
+		if stderrs.As(e, &target) {
 			return true
 		}
 	}

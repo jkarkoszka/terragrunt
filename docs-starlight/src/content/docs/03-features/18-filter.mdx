@@ -153,8 +153,8 @@ terragrunt find --filter 'type=unit'
 terragrunt find --filter 'type=stack'
 
 # Filter by external dependency status
-terragrunt find --dependencies --external --filter 'external=false'
-terragrunt find --dependencies --external --filter 'external=true'
+terragrunt find --dependencies --external --filter '*... | external=false'
+terragrunt find --dependencies --external --filter '*... | external=true'
 
 # Explicitly filter by name (useful for explicitly indicating that an expression is for a name if ambiguous)
 terragrunt find --filter 'name=stack*'
@@ -171,6 +171,43 @@ terragrunt find --filter 'name=stack*'
     - **dependency-of-app1** \<-- Matched by the fourth filter, but not the third filter
         - terragrunt.hcl
 </FileTree>
+
+### Source-Based Filtering
+
+Match units and stacks by their Terraform source URL or path specified in the `terraform` block of `terragrunt.hcl` files.
+
+```bash
+# Filter by exact source match
+terragrunt find --filter 'source=github.com/acme/foo'
+terragrunt find --filter 'source=gitlab.com/example/baz'
+terragrunt find --filter 'source=./module'
+
+# Filter by source using glob patterns
+terragrunt find --filter 'source=*github.com**acme/*'
+terragrunt find --filter 'source=git::git@github.com:acme/**'
+terragrunt find --filter 'source=**github.com**'
+terragrunt find --filter 'source=gitlab.com/**'
+```
+
+<FileTree>
+- .
+  - **github-acme-foo** \<-- Matched by source=github.com/acme/foo and source=*github.com**acme/*
+    - terragrunt.hcl (source: github.com/acme/foo)
+  - **github-acme-bar** \<-- Matched by source=*github.com**acme/* and source=git::git@github.com:acme/**
+    - terragrunt.hcl (source: git::git@github.com:acme/bar)
+  - **gitlab-example-baz** \<-- Matched by source=gitlab.com/example/baz and source=gitlab.com/**
+    - terragrunt.hcl (source: gitlab.com/example/baz)
+  - **local-module** \<-- Matched by source=./module
+    - terragrunt.hcl (source: ./module)
+    - module
+      - main.tf
+  - other-unit
+    - terragrunt.hcl (source: s3://bucket/module)
+</FileTree>
+
+<Aside type="note">
+The `source=` filter matches against the Terraform source URL or path specified in the `terraform` block of `terragrunt.hcl` files in units. It supports glob patterns, allowing you to match multiple sources with patterns like `*github.com**` or `gitlab.com/**`. This is useful for filtering units that use specific module sources, such as all units using a particular GitHub organization's modules or all local modules. This attribute may be supported on stacks in the future.
+</Aside>
 
 ### Negation
 
@@ -249,6 +286,125 @@ terragrunt find --filter './dev/** | type=unit | !name=unit1'
     - stack2
       - terragrunt.stack.hcl
 </FileTree>
+
+### Graph-Based Filtering
+
+Filter units and stacks based on their dependency relationships using graph traversal operators. This allows you to find components that depend on a target, or components that a target depends on.
+
+Graph-based filtering uses the ellipsis (`...`) operator to indicate graph traversal direction and the caret (`^`) operator to exclude the target from results.
+
+#### Include Dependencies
+
+Use `foo...` to include the target and all of its dependencies:
+
+```bash
+# Find 'service' and everything it depends on
+terragrunt find --filter 'service...'
+```
+
+<FileTree>
+- .
+  - **service** \<-- Matched (target)
+    - terragrunt.hcl (depends on: db, cache, vpc)
+  - **db** \<-- Matched (dependency of service)
+    - terragrunt.hcl (depends on: vpc)
+  - **cache** \<-- Matched (dependency of service)
+    - terragrunt.hcl (depends on: vpc)
+  - **vpc** \<-- Matched (dependency of service, db, cache)
+    - terragrunt.hcl
+</FileTree>
+
+#### Include Dependents
+
+Use `...foo` to include the target and all components that depend on it:
+
+```bash
+# Find 'vpc' and everything that depends on it
+terragrunt find --filter '...vpc'
+```
+
+<FileTree>
+- .
+  - **vpc** \<-- Matched (target)
+    - terragrunt.hcl
+  - **db** \<-- Matched (depends on vpc)
+    - terragrunt.hcl (depends on: vpc)
+  - **cache** \<-- Matched (depends on vpc)
+    - terragrunt.hcl (depends on: vpc)
+  - **service** \<-- Matched (depends on vpc via db and cache)
+    - terragrunt.hcl (depends on: db, cache)
+</FileTree>
+
+#### Include Both Directions
+
+Use `...foo...` to include the target, all its dependencies, and all its dependents:
+
+```bash
+# Find 'db' and its complete dependency graph
+terragrunt find --filter '...db...'
+```
+
+<FileTree>
+- .
+  - **vpc** \<-- Matched (dependency of db)
+    - terragrunt.hcl
+  - **db** \<-- Matched (target)
+    - terragrunt.hcl (depends on: vpc)
+  - **service** \<-- Matched (depends on db)
+    - terragrunt.hcl (depends on: db, cache)
+</FileTree>
+
+#### Exclude Target
+
+Use `^` to exclude the target component from results. This is useful when you want only the dependencies or dependents, but not the component itself:
+
+```bash
+# Find all dependents of 'vpc' but exclude 'vpc' itself
+terragrunt find --filter '...^vpc'
+```
+
+<FileTree>
+- .
+  - vpc \<-- Not matched by '...^vpc' (would be matched if ...vpc was used)
+    - terragrunt.hcl
+  - db \<-- Matched by '...^vpc' (dependent on vpc)
+    - terragrunt.hcl
+  - cache \<-- Matched by '...^vpc' (dependent on vpc)
+    - terragrunt.hcl
+  - service \<-- Excluded by '...^vpc' (dependent on vpc)
+    - terragrunt.hcl
+</FileTree>
+
+#### Combining with Other Filter Types
+
+Graph expressions work with path filters, attribute filters, and other filter types:
+
+```bash
+# Graph traversal with path filter
+terragrunt find --filter '{./service}...'
+
+# Graph traversal with attribute filter
+terragrunt find --filter '...type=unit'
+
+# Graph traversal with name filter using glob
+terragrunt find --filter '...app*...'
+```
+
+#### Combining with Intersection
+
+Use the `|` operator to refine graph traversal results:
+
+```bash
+# Find all dependencies of 'service', but filter out all the database's dependencies.
+terragrunt find --filter 'service... | !^db...'
+
+# Find all dependents of 'vpc' in the prod environment
+terragrunt find --filter './prod/** | ...vpc'
+```
+
+<Aside type="tip">
+Graph expressions require dependency/dependent discovery to work correctly. When using graph expressions, Terragrunt automatically discovers dependency relationships between components to enable graph traversal. This may add some overhead compared to simple name or path filters.
+</Aside>
 
 ### Union (Multiple Filters)
 
@@ -337,3 +493,45 @@ The `--filter` flag provides a unified alternative to multiple queue control fla
 | `--queue-exclude-dir` | `--filter '!./path/*'` |
 | `--queue-exclude-external` | `--filter '!external=true'` |
 | `--queue-include-external` | `--filter 'external=true'` |
+
+## Special Interactions
+
+Certain commands have special interactions with the `--filter` flag that are worth noting.
+
+### `hcl fmt`
+
+Unlike when used for most commands, the `--filter` flag is used to filter on individual HCL files when used with the `hcl fmt`.
+
+All other commands use `--filter` to filter on units and/or stacks (which are directories). As a result, only path-based filter expressions are supported. Attribute-based filters like `type=unit` or `name=my-app` are not applicable to file-level operations.
+
+Example:
+
+```bash
+# Supported: Path-based filtering
+terragrunt hcl fmt --filter './prod/**/*.hcl'
+
+# Not supported: Attribute-based filtering
+terragrunt hcl fmt --filter 'type=unit'  # This will not work
+```
+
+### `stack generate`
+
+When using `--filter` with `stack generate`, filter expressions will only be recognized if they explicitly target stacks. This is to ensure that filters are not over-applied, preventing any stack generation from occurring.
+
+```bash
+# Supported: Only generate the stacks that match the filter, as we are explicitly indicating that we are targeting stacks.
+terragrunt stack generate --filter 'name=prod | type=stack'
+
+# Not supported: This filter will be ignored, as we are not explicitly indicating that we are targeting stacks.
+terragrunt stack generate --filter 'name=prod'  # This will not work
+```
+
+The reason for this is that stack generation can also be done automatically as part of other commands, like `run`, and thus we need to make it clear that we're trying to control stack generation rather than run behavior.
+
+```bash
+# This will run any unit named 'vpc'
+terragrunt run --all --filter 'vpc' -- plan
+
+# This will run any unit named 'vpc', and prevent stack generation in any stack not named 'dev' (including any stacks named 'vpc')
+terragrunt stack run --filter 'vpc' --filter 'name=dev | type=stack' -- apply
+```

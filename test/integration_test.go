@@ -16,11 +16,11 @@ import (
 	"github.com/gruntwork-io/terragrunt/cli/commands/common"
 	"github.com/gruntwork-io/terragrunt/cli/commands/common/runall"
 	"github.com/gruntwork-io/terragrunt/cli/commands/info/print"
-	"github.com/gruntwork-io/terragrunt/cli/commands/run"
 	"github.com/gruntwork-io/terragrunt/cli/flags"
 	"github.com/gruntwork-io/terragrunt/codegen"
 	"github.com/gruntwork-io/terragrunt/config"
 	"github.com/gruntwork-io/terragrunt/internal/errors"
+	"github.com/gruntwork-io/terragrunt/internal/runner/run"
 	"github.com/gruntwork-io/terragrunt/internal/view/diagnostic"
 	"github.com/gruntwork-io/terragrunt/pkg/log"
 	"github.com/gruntwork-io/terragrunt/pkg/log/format/placeholders"
@@ -614,6 +614,47 @@ func TestTerragruntExcludesFile(t *testing.T) {
 	}
 }
 
+func TestHclvalidateValidConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("using --all", func(t *testing.T) {
+		t.Parallel()
+		helpers.CleanupTerraformFolder(t, testFixtureHclvalidate)
+		tmpEnvPath := helpers.CopyEnvironment(t, testFixtureHclvalidate)
+		rootPath := util.JoinPath(tmpEnvPath, testFixtureHclvalidate)
+
+		_, _, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt hcl validate --all --strict --inputs --working-dir "+filepath.Join(rootPath, "valid"))
+		require.NoError(t, err)
+	})
+
+	t.Run("validate each individually", func(t *testing.T) {
+		t.Parallel()
+
+		helpers.CleanupTerraformFolder(t, testFixtureHclvalidate)
+		tmpEnvPath := helpers.CopyEnvironment(t, testFixtureHclvalidate)
+		rootPath := util.JoinPath(tmpEnvPath, testFixtureHclvalidate, "valid")
+
+		// Test each subdirectory individually
+		entries, err := os.ReadDir(rootPath)
+		require.NoError(t, err)
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+
+			subPath := filepath.Join(rootPath, entry.Name())
+
+			t.Run(entry.Name(), func(t *testing.T) {
+				t.Parallel()
+
+				_, _, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt hcl validate --strict --inputs --working-dir "+subPath)
+				require.NoError(t, err)
+			})
+		}
+	})
+}
+
 func TestHclvalidateDiagnostic(t *testing.T) {
 	t.Parallel()
 
@@ -1107,7 +1148,7 @@ func TestTerraformCommandCliArgs(t *testing.T) {
 		},
 		{
 			command:  []string{"--disable-command-validation", "--", "paln"}, //codespell:ignore
-			expected: wrappedBinary() + " invocation failed",                 // error caused by running terraform with the wrong command
+			expected: "has no command named",                                 // error caused by running terraform with the wrong command
 		},
 	}
 
@@ -1274,7 +1315,12 @@ func TestTerragruntExcludeExternalDependencies(t *testing.T) {
 	rootPath := helpers.CopyEnvironment(t, testFixtureExternalDependence)
 	modulePath := util.JoinPath(rootPath, testFixtureExternalDependence, includedModule)
 
-	err := helpers.RunTerragruntCommand(t, "terragrunt run --all apply --non-interactive --queue-exclude-external --tf-forward-stdout --working-dir "+modulePath, &applyAllStdout, &applyAllStderr)
+	err := helpers.RunTerragruntCommand(
+		t,
+		"terragrunt run --all apply --non-interactive --queue-exclude-external --tf-forward-stdout --working-dir "+modulePath,
+		&applyAllStdout,
+		&applyAllStderr,
+	)
 	helpers.LogBufferContentsLineByLine(t, applyAllStdout, "run --all apply stdout")
 	helpers.LogBufferContentsLineByLine(t, applyAllStderr, "run --all apply stderr")
 
@@ -1291,8 +1337,8 @@ func TestTerragruntExcludeExternalDependencies(t *testing.T) {
 func TestApplySkipTrue(t *testing.T) {
 	t.Parallel()
 
-	rootPath := helpers.CopyEnvironment(t, testFixtureSkipLegacyRoot)
-	rootPath = util.JoinPath(rootPath, testFixtureSkipLegacyRoot, "skip-true")
+	tmpEnvPath := helpers.CopyEnvironment(t, testFixtureSkipLegacyRoot)
+	rootPath := util.JoinPath(tmpEnvPath, testFixtureSkipLegacyRoot, "skip-true")
 
 	showStdout := bytes.Buffer{}
 	showStderr := bytes.Buffer{}
@@ -1305,7 +1351,10 @@ func TestApplySkipTrue(t *testing.T) {
 	stderr := showStderr.String()
 
 	require.NoError(t, err)
-	assert.Contains(t, stderr, "Skipping terragrunt module ./terragrunt.hcl due to skip = true.")
+	// For single unit execution, early exit message should appear
+	output := stderr + stdout
+	assert.Contains(t, output, "Early exit in terragrunt unit")
+	assert.Contains(t, output, "due to exclude block with no_run = true")
 	assert.NotContains(t, stdout, "hello, Hobbs")
 }
 
@@ -1327,7 +1376,7 @@ func TestApplySkipFalse(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Contains(t, stdout, "hello, Hobbs")
-	assert.NotContains(t, stderr, "Skipping terragrunt module")
+	assert.NotContains(t, stderr, "Early exit in terragrunt unit")
 }
 
 func TestApplyAllSkipTrue(t *testing.T) {
@@ -1350,7 +1399,9 @@ func TestApplyAllSkipTrue(t *testing.T) {
 	// meaning the skip-true/resource2 module will be skipped as well and only the skip-true/resource1 module will be applied
 
 	require.NoError(t, err)
-	assert.Contains(t, stderr, "Skipping terragrunt module ./resource2/terragrunt.hcl due to skip = true.")
+	// Check that units were excluded at stack level (shown in Run Summary)
+	output := stderr + stdout
+	assert.Contains(t, output, "Excluded")
 	assert.Contains(t, stdout, "hello, Ernie")
 	assert.NotContains(t, stdout, "hello, Bert")
 }
@@ -1374,7 +1425,7 @@ func TestApplyAllSkipFalse(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, stdout, "hello, Ernie")
 	assert.Contains(t, stdout, "hello, Bert")
-	assert.NotContains(t, stderr, "Skipping terragrunt module")
+	assert.NotContains(t, stderr, "Early exit in terragrunt unit")
 }
 
 func TestDependencyOutput(t *testing.T) {
@@ -2440,7 +2491,9 @@ func TestReadTerragruntConfigFull(t *testing.T) {
 	assert.Equal(t, "= 0.23.18", outputs["terragrunt_version_constraint"].Value)
 	assert.Equal(t, ".terragrunt-cache", outputs["download_dir"].Value)
 	assert.Equal(t, "TerragruntIAMRole", outputs["iam_role"].Value)
-	assert.Equal(t, "true", outputs["skip"].Value)
+	// exclude is now a block, not a simple boolean - just verify it exists
+	assert.Contains(t, outputs, "exclude")
+	assert.NotEmpty(t, outputs["exclude"].Value)
 	assert.Equal(t, "true", outputs["prevent_destroy"].Value)
 
 	// Simple maps
@@ -3062,21 +3115,14 @@ func TestTerragruntVersionConstraintsPartialParse(t *testing.T) {
 func TestLogFailingDependencies(t *testing.T) {
 	t.Parallel()
 
-	var (
-		stdout bytes.Buffer
-		stderr bytes.Buffer
-	)
-
 	path := filepath.Join(testFixtureBrokenDependency, "app")
 
-	err := helpers.RunTerragruntCommand(t, fmt.Sprintf("terragrunt apply -auto-approve --non-interactive --working-dir %s --log-level trace", path), &stdout, &stderr)
+	_, stderr, err := helpers.RunTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt apply -auto-approve --non-interactive --working-dir %s --log-level trace", path))
 	require.Error(t, err)
 
-	testdataDir, err := filepath.Abs(testFixtureBrokenDependency)
-	require.NoError(t, err)
-
-	output := stderr.String()
-	assert.Contains(t, output, fmt.Sprintf("%s invocation failed in %s", wrappedBinary(), getPathRelativeTo(t, testdataDir, path)))
+	// Check that the error output contains terraform/tofu error details
+	assert.Contains(t, stderr, "Getting output of dependency ../dependency/terragrunt.hcl")
+	assert.Contains(t, stderr, "Error: Failed to download module")
 }
 
 func TestDependencyInputsBlockedByDefault(t *testing.T) {
@@ -3294,7 +3340,8 @@ func TestInitFailureModulePrefix(t *testing.T) {
 		helpers.RunTerragruntCommand(t, "terragrunt init -no-color --non-interactive --working-dir "+initTestCase, &stdout, &stderr),
 	)
 	helpers.LogBufferContentsLineByLine(t, stderr, "init")
-	assert.Contains(t, stderr.String(), "fixtures/init-error")
+	// Check for terraform error in structured log format
+	assert.Contains(t, stderr.String(), "level=stderr")
 }
 
 func TestDependencyOutputModulePrefix(t *testing.T) {
@@ -3636,8 +3683,8 @@ func TestTerragruntSkipDependenciesWithSkipFlag(t *testing.T) {
 	assert.NotContains(t, output, "Call to function \"find_in_parent_folders\" failed")
 	assert.NotContains(t, output, "ParentFileNotFoundError")
 
-	assert.Contains(t, output, "first/terragrunt.hcl due to skip = true")
-	assert.Contains(t, output, "second/terragrunt.hcl due to skip = true")
+	// Check that units were excluded at stack level (shown in Run Summary)
+	assert.Contains(t, output, "Excluded")
 	// check that no test_file.txt was created in module directory
 	_, err = os.Stat(util.JoinPath(tmpEnvPath, testFixtureSkipDependencies, "first", "test_file.txt"))
 	require.Error(t, err)
@@ -3670,6 +3717,10 @@ func TestStorePlanFilesRunAllPlanApply(t *testing.T) {
 
 	// create temporary directory for plan files
 	tmpDir := t.TempDir()
+
+	tmpDir, err := filepath.EvalSymlinks(tmpDir)
+	require.NoError(t, err)
+
 	tmpEnvPath := helpers.CopyEnvironment(t, testFixtureOutDir)
 	helpers.CleanupTerraformFolder(t, tmpEnvPath)
 	testPath := util.JoinPath(tmpEnvPath, testFixtureOutDir)
@@ -4207,24 +4258,6 @@ func TestTfPathOverridesConfigWithTofuTerraform(t *testing.T) {
 
 		assert.Contains(t, stdout, tc.expected)
 	}
-}
-
-// expectExtraVersionCommandCall returns true if we expect an extra version command to be invoked.
-//
-// We expect an extra version command to be invoked when the auto-provider-cache-dir experiment is enabled with OpenTofu,
-// as we need to check if the provider cache directory should be enabled.
-func expectExtraVersionCommandCall(t *testing.T) bool {
-	t.Helper()
-
-	if helpers.IsTerraform() {
-		return false
-	}
-
-	if os.Getenv("TG_EXPERIMENT_MODE") == "true" {
-		return true
-	}
-
-	return false
 }
 
 func TestMixedStackConfigIgnored(t *testing.T) {

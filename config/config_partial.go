@@ -79,12 +79,11 @@ type terraformConfigSourceOnly struct {
 	Remain hcl.Body `hcl:",remain"`
 }
 
-// terragruntFlags is a struct that can be used to only decode the flag attributes (skip and prevent_destroy)
+// terragruntFlags is a struct that can be used to only decode the flag attributes (prevent_destroy)
 type terragruntFlags struct {
 	IamRole             *string  `hcl:"iam_role,attr"`
 	IamWebIdentityToken *string  `hcl:"iam_web_identity_token,attr"`
 	PreventDestroy      *bool    `hcl:"prevent_destroy,attr"`
-	Skip                *bool    `hcl:"skip,attr"`
 	Remain              hcl.Body `hcl:",remain"`
 }
 
@@ -175,7 +174,7 @@ func DecodeBaseBlocks(ctx *ParsingContext, l log.Logger, file *hclparse.File, in
 		errs = errs.Append(err)
 	}
 
-	localsAsCtyVal, err := convertValuesMapToCtyVal(locals)
+	localsAsCtyVal, err := ConvertValuesMapToCtyVal(locals)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +216,7 @@ func flagsAsCty(ctx *ParsingContext, tgFlags FeatureFlags) (cty.Value, error) {
 		}
 	}
 
-	flagsAsCtyVal, err := convertValuesMapToCtyVal(evaluatedFlags)
+	flagsAsCtyVal, err := ConvertValuesMapToCtyVal(evaluatedFlags)
 	if err != nil {
 		return cty.NilVal, err
 	}
@@ -359,6 +358,14 @@ func PartialParseConfigString(ctx *ParsingContext, l log.Logger, configPath, con
 func PartialParseConfig(ctx *ParsingContext, l log.Logger, file *hclparse.File, includeFromChild *IncludeConfig) (*TerragruntConfig, error) {
 	errs := &errors.MultiError{}
 
+	// Detect and block deprecated configurations early, before attempting to parse.
+	// This ensures included configs with deprecated syntax get clear error messages
+	// instead of cryptic "Could not find Terragrunt configuration settings" errors.
+	// See: https://github.com/gruntwork-io/terragrunt/issues/4983
+	if err := DetectDeprecatedConfigurations(ctx, l, file); err != nil {
+		return nil, err
+	}
+
 	ctx = ctx.WithTrackInclude(nil)
 
 	// read unit files and add to context
@@ -479,10 +486,6 @@ func PartialParseConfig(ctx *ParsingContext, l log.Logger, file *hclparse.File, 
 
 			if decoded.PreventDestroy != nil {
 				output.PreventDestroy = decoded.PreventDestroy
-			}
-
-			if decoded.Skip != nil {
-				output.Skip = decoded.Skip
 			}
 
 			if decoded.IamRole != nil {

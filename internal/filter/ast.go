@@ -13,8 +13,14 @@ type Expression interface {
 	expressionNode()
 	// String returns a string representation of the expression for debugging.
 	String() string
-	// RequiresHCLParsing returns true if the expression requires parsing Terragrunt HCL configurations.
-	RequiresHCLParsing() (Expression, bool)
+	// RequiresDiscovery returns the first expression that requires discovery of Terragrunt components if any do.
+	// Additionally, it returns a secondary value of true if any do.
+	RequiresDiscovery() (Expression, bool)
+	// RequiresParse returns the first expression that requires parsing Terragrunt HCL configurations if any do.
+	// Additionally, it returns a secondary value of true if any do.
+	RequiresParse() (Expression, bool)
+	// IsRestrictedToStacks returns true if the expression is restricted to stacks.
+	IsRestrictedToStacks() bool
 }
 
 // PathFilter represents a path or glob filter (e.g., "./path/**/*" or "/absolute/path").
@@ -48,9 +54,11 @@ func (p *PathFilter) CompileGlob() (glob.Glob, error) {
 	return p.compiledGlob, p.compileErr
 }
 
-func (p *PathFilter) expressionNode()                        {}
-func (p *PathFilter) String() string                         { return p.Value }
-func (p *PathFilter) RequiresHCLParsing() (Expression, bool) { return p, false }
+func (p *PathFilter) expressionNode()                       {}
+func (p *PathFilter) String() string                        { return p.Value }
+func (p *PathFilter) RequiresDiscovery() (Expression, bool) { return p, false }
+func (p *PathFilter) RequiresParse() (Expression, bool)     { return p, false }
+func (p *PathFilter) IsRestrictedToStacks() bool            { return false }
 
 // AttributeFilter represents a key-value attribute filter (e.g., "name=my-app").
 type AttributeFilter struct {
@@ -60,6 +68,11 @@ type AttributeFilter struct {
 	Value        string
 	WorkingDir   string
 	compileOnce  sync.Once
+}
+
+// NewAttributeFilter creates a new AttributeFilter with lazy glob compilation.
+func NewAttributeFilter(key string, value string, workingDir string) *AttributeFilter {
+	return &AttributeFilter{Key: key, Value: value, WorkingDir: workingDir}
 }
 
 // CompileGlob returns the compiled glob pattern for name and reading filters, compiling it on first call.
@@ -90,12 +103,29 @@ func (a *AttributeFilter) CompileGlob() (glob.Glob, error) {
 
 // supportsGlob returns true if the attribute filter supports glob patterns.
 func (a *AttributeFilter) supportsGlob() bool {
-	return a.Key == AttributeReading || a.Key == AttributeName
+	return a.Key == AttributeReading || a.Key == AttributeName || a.Key == AttributeSource
 }
 
-func (a *AttributeFilter) expressionNode()                        {}
-func (a *AttributeFilter) String() string                         { return a.Key + "=" + a.Value }
-func (a *AttributeFilter) RequiresHCLParsing() (Expression, bool) { return a, true }
+func (a *AttributeFilter) expressionNode()                       {}
+func (a *AttributeFilter) String() string                        { return a.Key + "=" + a.Value }
+func (a *AttributeFilter) RequiresDiscovery() (Expression, bool) { return a, true }
+func (a *AttributeFilter) RequiresParse() (Expression, bool) {
+	switch a.Key {
+	// All of these attributes can be determined based on the component + configuration filepath.
+	case AttributeName, AttributeType, AttributeExternal:
+		return nil, false
+	// We only know what a component reads if we parse it.
+	case AttributeReading:
+		return a, true
+	// We default to true to be conservative in-case we forget to register
+	// a new attribute here that does require parsing.
+	default:
+		return nil, true
+	}
+}
+func (a *AttributeFilter) IsRestrictedToStacks() bool {
+	return a.Key == "type" && a.Value == "stack"
+}
 
 // PrefixExpression represents a prefix operator expression (e.g., "!name=foo").
 type PrefixExpression struct {
@@ -103,10 +133,36 @@ type PrefixExpression struct {
 	Operator string
 }
 
+// NewPrefixExpression creates a new PrefixExpression.
+func NewPrefixExpression(operator string, right Expression) *PrefixExpression {
+	return &PrefixExpression{Operator: operator, Right: right}
+}
+
 func (p *PrefixExpression) expressionNode() {}
 func (p *PrefixExpression) String() string  { return p.Operator + p.Right.String() }
-func (p *PrefixExpression) RequiresHCLParsing() (Expression, bool) {
-	return p.Right.RequiresHCLParsing()
+func (p *PrefixExpression) RequiresDiscovery() (Expression, bool) {
+	return p.Right.RequiresDiscovery()
+}
+func (p *PrefixExpression) RequiresParse() (Expression, bool) {
+	return p.Right.RequiresParse()
+}
+func (p *PrefixExpression) IsRestrictedToStacks() bool {
+	switch p.Operator {
+	case "!":
+		switch a := p.Right.(type) {
+		case *AttributeFilter:
+			switch a.Key {
+			case "type":
+				return a.Value != "stack"
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	default:
+		return false
+	}
 }
 
 // InfixExpression represents an infix operator expression (e.g., "./apps/* | name=bar").
@@ -116,14 +172,93 @@ type InfixExpression struct {
 	Operator string
 }
 
+// NewInfixExpression creates a new InfixExpression.
+func NewInfixExpression(left Expression, operator string, right Expression) *InfixExpression {
+	return &InfixExpression{Left: left, Operator: operator, Right: right}
+}
+
 func (i *InfixExpression) expressionNode() {}
 func (i *InfixExpression) String() string {
 	return i.Left.String() + " " + i.Operator + " " + i.Right.String()
 }
-func (i *InfixExpression) RequiresHCLParsing() (Expression, bool) {
-	if f, ok := i.Left.RequiresHCLParsing(); ok {
-		return f, true
+func (i *InfixExpression) RequiresDiscovery() (Expression, bool) {
+	if _, ok := i.Left.RequiresDiscovery(); ok {
+		return i, true
 	}
 
-	return i.Right.RequiresHCLParsing()
+	if _, ok := i.Right.RequiresDiscovery(); ok {
+		return i, true
+	}
+
+	return nil, false
 }
+func (i *InfixExpression) RequiresParse() (Expression, bool) {
+	if _, ok := i.Left.RequiresParse(); ok {
+		return i, true
+	}
+
+	if _, ok := i.Right.RequiresParse(); ok {
+		return i, true
+	}
+
+	return nil, false
+}
+func (i *InfixExpression) IsRestrictedToStacks() bool {
+	switch i.Operator {
+	case "|":
+		return i.Left.IsRestrictedToStacks() || i.Right.IsRestrictedToStacks()
+	default:
+		return false
+	}
+}
+
+// GraphExpression represents a graph traversal expression (e.g., "...foo", "foo...", "...foo...", "^foo").
+type GraphExpression struct {
+	Target              Expression
+	IncludeDependents   bool
+	IncludeDependencies bool
+	ExcludeTarget       bool
+}
+
+// NewGraphExpression creates a new GraphExpression.
+func NewGraphExpression(
+	target Expression,
+	includeDependents bool,
+	includeDependencies bool,
+	excludeTarget bool,
+) *GraphExpression {
+	return &GraphExpression{
+		Target:              target,
+		IncludeDependents:   includeDependents,
+		IncludeDependencies: includeDependencies,
+		ExcludeTarget:       excludeTarget,
+	}
+}
+
+func (g *GraphExpression) expressionNode() {}
+func (g *GraphExpression) String() string {
+	result := ""
+	if g.IncludeDependents {
+		result += "..."
+	}
+
+	if g.ExcludeTarget {
+		result += "^"
+	}
+
+	result += g.Target.String()
+	if g.IncludeDependencies {
+		result += "..."
+	}
+
+	return result
+}
+func (g *GraphExpression) RequiresDiscovery() (Expression, bool) {
+	// Graph expressions require dependency discovery to traverse the graph
+	return g, true
+}
+func (g *GraphExpression) RequiresParse() (Expression, bool) {
+	// Graph expressions require parsing to traverse the graph.
+	return g, true
+}
+func (g *GraphExpression) IsRestrictedToStacks() bool { return false }

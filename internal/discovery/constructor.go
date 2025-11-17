@@ -1,6 +1,10 @@
 package discovery
 
 import (
+	"path/filepath"
+	"runtime"
+
+	"github.com/gruntwork-io/terragrunt/config"
 	"github.com/gruntwork-io/terragrunt/internal/component"
 	"github.com/gruntwork-io/terragrunt/internal/experiment"
 	"github.com/gruntwork-io/terragrunt/internal/filter"
@@ -13,7 +17,7 @@ type DiscoveryCommandOptions struct {
 	QueueConstructAs string
 	FilterQueries    []string
 	Experiments      experiment.Experiments
-	Hidden           bool
+	NoHidden         bool
 	Dependencies     bool
 	External         bool
 	Exclude          bool
@@ -28,13 +32,21 @@ type HCLCommandOptions struct {
 	Experiments   experiment.Experiments
 }
 
+// StackGenerateOptions contains options for stack generate commands.
+type StackGenerateOptions struct {
+	WorkingDir    string
+	FilterQueries []string
+	Experiments   experiment.Experiments
+}
+
 // NewForDiscoveryCommand creates a Discovery configured for discovery commands (find/list).
 func NewForDiscoveryCommand(opts DiscoveryCommandOptions) (*Discovery, error) {
 	d := NewDiscovery(opts.WorkingDir).
-		WithSuppressParseErrors()
+		WithSuppressParseErrors().
+		WithBreakCycles()
 
-	if opts.Hidden {
-		d = d.WithHidden()
+	if opts.NoHidden {
+		d = d.WithNoHidden()
 	}
 
 	if opts.Dependencies || opts.External {
@@ -81,13 +93,17 @@ func NewForDiscoveryCommand(opts DiscoveryCommandOptions) (*Discovery, error) {
 		})
 	}
 
-	if opts.Experiments.Evaluate(experiment.FilterFlag) && len(opts.FilterQueries) > 0 {
-		filters, err := filter.ParseFilterQueries(opts.FilterQueries, opts.WorkingDir)
-		if err != nil {
-			return nil, err
-		}
+	if opts.Experiments.Evaluate(experiment.FilterFlag) {
+		d = d.WithFilterFlagEnabled()
 
-		d = d.WithFilters(filters)
+		if len(opts.FilterQueries) > 0 {
+			filters, err := filter.ParseFilterQueries(opts.FilterQueries, opts.WorkingDir)
+			if err != nil {
+				return nil, err
+			}
+
+			d = d.WithFilters(filters)
+		}
 	}
 
 	return d, nil
@@ -97,14 +113,60 @@ func NewForDiscoveryCommand(opts DiscoveryCommandOptions) (*Discovery, error) {
 func NewForHCLCommand(opts HCLCommandOptions) (*Discovery, error) {
 	d := NewDiscovery(opts.WorkingDir)
 
-	if opts.Experiments.Evaluate(experiment.FilterFlag) && len(opts.FilterQueries) > 0 {
-		filters, err := filter.ParseFilterQueries(opts.FilterQueries, opts.WorkingDir)
-		if err != nil {
-			return nil, err
-		}
+	if opts.Experiments.Evaluate(experiment.FilterFlag) {
+		d = d.WithFilterFlagEnabled()
 
-		d = d.WithFilters(filters)
+		if len(opts.FilterQueries) > 0 {
+			filters, err := filter.ParseFilterQueries(opts.FilterQueries, opts.WorkingDir)
+			if err != nil {
+				return nil, err
+			}
+
+			d = d.WithFilters(filters)
+		}
 	}
 
 	return d, nil
+}
+
+// NewForStackGenerate creates a Discovery configured for `stack generate`.
+func NewForStackGenerate(opts StackGenerateOptions) (*Discovery, error) {
+	d := NewDiscovery(opts.WorkingDir)
+
+	if opts.Experiments.Evaluate(experiment.FilterFlag) {
+		d = d.WithFilterFlagEnabled()
+
+		if len(opts.FilterQueries) > 0 {
+			filters, err := filter.ParseFilterQueries(opts.FilterQueries, opts.WorkingDir)
+			if err != nil {
+				return nil, err
+			}
+
+			d = d.WithFilters(filters.RestrictToStacks())
+		}
+	}
+
+	return d, nil
+}
+
+// NewDiscovery creates a new Discovery.
+func NewDiscovery(dir string, opts ...DiscoveryOption) *Discovery {
+	numWorkers := max(min(runtime.NumCPU(), maxDiscoveryWorkers), defaultDiscoveryWorkers)
+
+	discovery := &Discovery{
+		workingDir: dir,
+		includeDirs: []string{
+			config.StackDir,
+			filepath.Join(config.StackDir, "**"),
+		},
+		numWorkers:         numWorkers,
+		useDefaultExcludes: true,
+		maxDependencyDepth: defaultMaxDependencyDepth,
+	}
+
+	for _, opt := range opts {
+		opt(discovery)
+	}
+
+	return discovery
 }
