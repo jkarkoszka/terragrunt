@@ -4,10 +4,10 @@ package module
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
-	"github.com/gruntwork-io/go-commons/collections"
-	"github.com/gruntwork-io/terragrunt/internal/errors"
+	"github.com/gruntwork-io/terragrunt/internal/util"
 	"github.com/gruntwork-io/terragrunt/pkg/log"
 )
 
@@ -16,10 +16,7 @@ const (
 	maxDescriptionLength = 200
 )
 
-var (
-	terraformFileExts = []string{".tf"}
-	ignoreFiles       = []string{"terraform-cloud-enterprise-private-module-registry-placeholder.tf"}
-)
+var ignoreFiles = []string{"terraform-cloud-enterprise-private-module-registry-placeholder.tf"}
 
 type Modules []*Module
 
@@ -34,7 +31,7 @@ type Module struct {
 }
 
 // NewModule returns a module instance if the given `moduleDir` path contains an OpenTofu/Terraform module, otherwise returns nil.
-func NewModule(repo *Repo, moduleDir string) (*Module, error) {
+func NewModule(l log.Logger, repo *Repo, moduleDir string) (*Module, error) {
 	module := &Module{
 		Repo:      repo,
 		cloneURL:  repo.cloneURL,
@@ -46,11 +43,11 @@ func NewModule(repo *Repo, moduleDir string) (*Module, error) {
 		return nil, err
 	}
 
-	repo.logger.Debugf("Found module in directory %q", moduleDir)
+	l.Debugf("Found module in directory %q", moduleDir)
 
 	module.url = repo.ModuleURL(moduleDir)
 
-	repo.logger.Debugf("Module URL: %s", module.url)
+	l.Debugf("Module URL: %s", module.url)
 
 	modulePath := filepath.Join(module.repoPath, module.moduleDir)
 
@@ -62,10 +59,6 @@ func NewModule(repo *Repo, moduleDir string) (*Module, error) {
 	module.Doc = doc
 
 	return module, nil
-}
-
-func (module *Module) Logger() log.Logger {
-	return module.logger
 }
 
 // FilterValue implements /github.com/charmbracelet/bubbles.list.Item.FilterValue
@@ -95,14 +88,28 @@ func (module *Module) URL() string {
 	return module.url
 }
 
+// TerraformSourcePath returns the module source URL in the format expected by go-getter:
+// baseURL//moduleDir?query (e.g., git::https://github.com/org/repo.git//modules/foo?ref=v1.0.0)
 func (module *Module) TerraformSourcePath() string {
-	return module.cloneURL + "//" + module.moduleDir
+	if module.moduleDir == "" {
+		return module.cloneURL
+	}
+
+	// Split on ? to separate base URL from query string
+	base, query, _ := strings.Cut(module.cloneURL, "?")
+
+	result := base + "//" + module.moduleDir
+	if query != "" {
+		result += "?" + query
+	}
+
+	return result
 }
 
 func (module *Module) isValid() (bool, error) {
 	files, err := os.ReadDir(filepath.Join(module.repoPath, module.moduleDir))
 	if err != nil {
-		return false, errors.New(err)
+		return false, err
 	}
 
 	for _, file := range files {
@@ -110,12 +117,11 @@ func (module *Module) isValid() (bool, error) {
 			continue
 		}
 
-		if collections.ListContainsElement(ignoreFiles, file.Name()) {
+		if slices.Contains(ignoreFiles, file.Name()) {
 			continue
 		}
 
-		ext := filepath.Ext(file.Name())
-		if collections.ListContainsElement(terraformFileExts, ext) {
+		if util.IsTFFile(file.Name()) {
 			return true, nil
 		}
 	}
@@ -125,4 +131,12 @@ func (module *Module) isValid() (bool, error) {
 
 func (module *Module) ModuleDir() string {
 	return module.moduleDir
+}
+
+// NewModuleForTest creates a Module for testing purposes.
+func NewModuleForTest(cloneURL, moduleDir string) *Module {
+	return &Module{
+		cloneURL:  cloneURL,
+		moduleDir: moduleDir,
+	}
 }

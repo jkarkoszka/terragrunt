@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/gruntwork-io/terragrunt/internal/errors"
 	. "github.com/gruntwork-io/terragrunt/pkg/log/format/options"      //nolint:revive
 	. "github.com/gruntwork-io/terragrunt/pkg/log/format/placeholders" //nolint:revive
 )
@@ -63,9 +62,7 @@ func NewPrettyFormatPlaceholders() Placeholders {
 			Suffix(": "),
 			Color(CyanColor),
 		),
-		Message(
-			PathFormat(RelativePath),
-		),
+		Message(),
 		Field(CacheServerURLKeyName,
 			Prefix(" "+CacheServerURLKeyName+"="),
 		),
@@ -108,7 +105,6 @@ func NewJSONFormatPlaceholders() Placeholders {
 		Message(
 			Prefix(`, "msg":"`),
 			Suffix(`"`),
-			PathFormat(RelativePath),
 			Color(DisableColor),
 			Escape(JSONEscape),
 		),
@@ -135,7 +131,6 @@ func NewKeyValueFormatPlaceholders() Placeholders {
 		),
 		Message(
 			Prefix(" msg="),
-			PathFormat(RelativePath),
 			Color(DisableColor),
 		),
 	}
@@ -155,5 +150,5 @@ func ParseFormat(str string) (Placeholders, error) {
 		}
 	}
 
-	return nil, errors.Errorf("available values: %s", strings.Join(slices.Collect(maps.Keys(presets)), ","))
+	return nil, fmt.Errorf("available values: %s", strings.Join(slices.Collect(maps.Keys(presets)), ","))
 }

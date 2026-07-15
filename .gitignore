@@ -10,16 +10,20 @@ vendor
 .terragrunt-cache
 .bundle
 .ruby-version
-.terraform.lock.hcl
 terragrunt
 .DS_Store
 .go-version
 .terragrunt-stack
 .devcontainer.json
 .cursor/
+.claude/
 .env
 .licensei.cache
 bin
+
+# Coverage reports
+coverage-summary.*
+comparison-report.*
 
 # Windows code signing resources
 rsrc.syso

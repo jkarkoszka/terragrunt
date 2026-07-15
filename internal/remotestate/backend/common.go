@@ -4,24 +4,24 @@ import (
 	"context"
 	"sync"
 
-	"github.com/gruntwork-io/terragrunt/options"
+	"github.com/gruntwork-io/terragrunt/internal/venv"
 	"github.com/gruntwork-io/terragrunt/pkg/log"
-	"github.com/puzpuzpuz/xsync/v3"
+	"github.com/puzpuzpuz/xsync/v4"
 )
 
 var _ Backend = new(CommonBackend)
 
 type CommonBackend struct {
-	bucketLocks   *xsync.MapOf[string, *sync.Mutex]
-	initedConfigs *xsync.MapOf[string, bool]
+	bucketLocks   *xsync.Map[string, *sync.Mutex]
+	initedConfigs *xsync.Map[string, bool]
 	name          string
 }
 
 func NewCommonBackend(name string) *CommonBackend {
 	return &CommonBackend{
 		name:          name,
-		bucketLocks:   xsync.NewMapOf[string, *sync.Mutex](),
-		initedConfigs: xsync.NewMapOf[string, bool](),
+		bucketLocks:   xsync.NewMap[string, *sync.Mutex](),
+		initedConfigs: xsync.NewMap[string, bool](),
 	}
 }
 
@@ -30,40 +30,76 @@ func (backend *CommonBackend) Name() string {
 	return backend.name
 }
 
-func (backend *CommonBackend) IsVersionControlEnabled(ctx context.Context, l log.Logger, config Config, opts *options.TerragruntOptions) (bool, error) {
+func (backend *CommonBackend) IsVersionControlEnabled(
+	ctx context.Context,
+	l log.Logger,
+	v venv.Venv,
+	config Config,
+	opts *Options,
+) (bool, error) {
 	l.Warnf("Checking version control for %s backend not implemented.", backend.Name())
 
 	return false, nil
 }
 
 // NeedsBootstrap implements `backends.NeedsBootstrap` interface.
-func (backend *CommonBackend) NeedsBootstrap(ctx context.Context, l log.Logger, config Config, opts *options.TerragruntOptions) (bool, error) {
+func (backend *CommonBackend) NeedsBootstrap(
+	ctx context.Context,
+	l log.Logger,
+	v venv.Venv,
+	config Config,
+	opts *Options,
+) (bool, error) {
 	return false, nil
 }
 
 // Bootstrap implements `backends.Bootstrap` interface.
-func (backend *CommonBackend) Bootstrap(ctx context.Context, l log.Logger, config Config, opts *options.TerragruntOptions) error {
+func (backend *CommonBackend) Bootstrap(
+	ctx context.Context,
+	l log.Logger,
+	v venv.Venv,
+	config Config,
+	opts *Options,
+) error {
 	l.Warnf("Bootstrap for %s backend not implemented.", backend.Name())
 
 	return nil
 }
 
 // Migrate implements `backends.Migrate` interface.
-func (backend *CommonBackend) Migrate(ctx context.Context, l log.Logger, srcConfig, dstConfig Config, opts *options.TerragruntOptions) error {
+func (backend *CommonBackend) Migrate(
+	ctx context.Context,
+	l log.Logger,
+	v venv.Venv,
+	srcConfig, dstConfig Config,
+	opts *Options,
+) error {
 	l.Warnf("Migrate for %s backend not implemented.", backend.Name())
 
 	return nil
 }
 
 // Delete implements `backends.Delete` interface.
-func (backend *CommonBackend) Delete(ctx context.Context, l log.Logger, config Config, opts *options.TerragruntOptions) error {
+func (backend *CommonBackend) Delete(
+	ctx context.Context,
+	l log.Logger,
+	v venv.Venv,
+	config Config,
+	opts *Options,
+) error {
 	l.Warnf("Delete for %s backend not implemented.", backend.Name())
 
 	return nil
 }
 
 // DeleteBucket implements `backends.DeleteBucket` interface.
-func (backend *CommonBackend) DeleteBucket(ctx context.Context, l log.Logger, config Config, opts *options.TerragruntOptions) error {
+func (backend *CommonBackend) DeleteBucket(
+	ctx context.Context,
+	l log.Logger,
+	v venv.Venv,
+	config Config,
+	opts *Options,
+) error {
 	l.Warnf("Deleting entire bucket for %s backend not implemented.", backend.Name())
 
 	return nil
@@ -75,8 +111,8 @@ func (backend *CommonBackend) GetTFInitArgs(config Config) map[string]any {
 }
 
 func (backend *CommonBackend) GetBucketMutex(bucketName string) *sync.Mutex {
-	mu, _ := backend.bucketLocks.LoadOrCompute(bucketName, func() *sync.Mutex {
-		return new(sync.Mutex)
+	mu, _ := backend.bucketLocks.LoadOrCompute(bucketName, func() (*sync.Mutex, bool) {
+		return new(sync.Mutex), false
 	})
 
 	return mu

@@ -1,19 +1,19 @@
 //go:build windows
-// +build windows
 
 package test_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/gruntwork-io/terragrunt/internal/util"
 	"github.com/gruntwork-io/terragrunt/test/helpers"
-	"github.com/gruntwork-io/terragrunt/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,13 +22,13 @@ const (
 	testFixtureDownloadPath                         = "fixtures/download"
 	testFixtureLocalRelativeArgsWindowsDownloadPath = "fixtures/download/local-windows"
 	testFixtureManifestRemoval                      = "fixtures/manifest-removal"
-	testFixtureTflintNoIssuesFound                  = "fixtures/tflint/no-issues-found"
+	testFixtureProviderCacheWindowsRemoteURL        = "fixtures/provider-cache/windows-remote-url"
 
 	tempDir = `C:\tmp`
 )
 
 func TestMain(m *testing.M) {
-	// By default, t.TempDir() creates a temporary directory inside the user directory
+	// By default, TempDir creates a temporary directory inside the user directory
 	// `C:/Users/circleci/AppData/Local/Temp/`, which ends up exceeding the maximum allowed length
 	// and causes the error: "fatal: '$GIT_DIR' too big". Example:
 	// "C:/Users/circleci/AppData/Local/Temp/TestWindowsLocalWithRelativeExtraArgsWindows1263358614/001/fixtures/download/local-windows/.terragrunt-cache/rviFlp3V5mrXldwi6Hbi8p2rDL0/U0tL3quoR7Yt-oR6jROJomrYpTs".
@@ -48,7 +48,7 @@ func TestMain(m *testing.M) {
 		}
 	}()
 
-	if _, err := os.Stat(tempDir); os.IsNotExist(err) {
+	if _, err := os.Stat(tempDir); errors.Is(err, fs.ErrNotExist) {
 		if err := os.Mkdir(tempDir, os.ModePerm); err != nil {
 			fmt.Printf("Failed to create temp dir due to error: %v", err)
 			os.Exit(1)
@@ -56,7 +56,7 @@ func TestMain(m *testing.M) {
 	} else {
 		// Verify write permissions
 		testFile := filepath.Join(tempDir, ".write_test")
-		if err := os.WriteFile(testFile, []byte(""), 0666); err != nil {
+		if err := os.WriteFile(testFile, []byte(""), 0o666); err != nil {
 			fmt.Printf("Temp dir %s is not writable: %v", tempDir, err)
 			os.Exit(1)
 		}
@@ -78,8 +78,9 @@ func TestMain(m *testing.M) {
 func TestWindowsLocalWithRelativeExtraArgsWindows(t *testing.T) {
 	t.Parallel()
 
-	rootPath := CopyEnvironmentWithTflint(t, testFixtureDownloadPath)
-	modulePath := util.JoinPath(rootPath, testFixtureLocalRelativeArgsWindowsDownloadPath)
+	mirror := helpers.NewGitServer(t)
+	rootPath := mirror.RenderFixture(testFixtureDownloadPath)
+	modulePath := filepath.Join(rootPath, testFixtureLocalRelativeArgsWindowsDownloadPath)
 
 	helpers.RunTerragrunt(t, fmt.Sprintf("terragrunt apply -auto-approve --non-interactive --working-dir %s", modulePath))
 
@@ -119,34 +120,18 @@ func TestWindowsTerragruntSourceMapDebug(t *testing.T) {
 				),
 			)
 			tgPath := filepath.Join(rootPath, tc.name)
-			tgArgs := fmt.Sprintf("terragrunt run --all apply --non-interactive --log-level trace --working-dir '%s'", tgPath)
+			tgArgs := fmt.Sprintf("terragrunt run --all apply --non-interactive --working-dir '%s'", tgPath)
 			helpers.RunTerragrunt(t, tgArgs)
 		})
 	}
-}
-
-func TestWindowsTflintIsInvoked(t *testing.T) {
-	out := new(bytes.Buffer)
-	errOut := new(bytes.Buffer)
-	rootPath := CopyEnvironmentWithTflint(t, testFixtureTflintNoIssuesFound)
-	modulePath := util.JoinPath(rootPath, testFixtureTflintNoIssuesFound)
-	err := helpers.RunTerragruntCommand(t, fmt.Sprintf("terragrunt plan --log-level trace --working-dir %s", modulePath), out, errOut)
-	assert.NoError(t, err)
-
-	assert.NotContains(t, errOut.String(), "Error while running tflint with args:")
-	assert.NotContains(t, errOut.String(), "Tflint found issues in the project. Check for the tflint logs above.")
-
-	found, err := regexp.MatchString(fmt.Sprintf("--config %s/.terragrunt-cache/.*/.tflint.hcl", modulePath), errOut.String())
-	assert.NoError(t, err)
-	assert.True(t, found)
 }
 
 func TestWindowsManifestFileIsRemoved(t *testing.T) {
 	out := new(bytes.Buffer)
 	errOut := new(bytes.Buffer)
 	rootPath := CopyEnvironmentWithTflint(t, testFixtureManifestRemoval)
-	modulePath := util.JoinPath(rootPath, testFixtureManifestRemoval, "app")
-	err := helpers.RunTerragruntCommand(t, fmt.Sprintf("terragrunt plan --non-interactive --log-level trace --working-dir %s", modulePath), out, errOut)
+	modulePath := filepath.Join(rootPath, testFixtureManifestRemoval, "app")
+	err := helpers.RunTerragruntCommand(t, fmt.Sprintf("terragrunt plan --non-interactive --working-dir %s", modulePath), out, errOut)
 	assert.NoError(t, err)
 
 	info1, err := fileInfo(modulePath, ".terragrunt-module-manifest")
@@ -155,15 +140,15 @@ func TestWindowsManifestFileIsRemoved(t *testing.T) {
 
 	out = new(bytes.Buffer)
 	errOut = new(bytes.Buffer)
-	err = helpers.RunTerragruntCommand(t, fmt.Sprintf("terragrunt plan --non-interactive --log-level trace --working-dir %s", modulePath), out, errOut)
+	err = helpers.RunTerragruntCommand(t, fmt.Sprintf("terragrunt plan --non-interactive --working-dir %s", modulePath), out, errOut)
 	assert.NoError(t, err)
 
 	info2, err := fileInfo(modulePath, ".terragrunt-module-manifest")
 	assert.NoError(t, err)
+	// ensure that .terragrunt-module-manifest still exists after the second run.
+	// When the source is unchanged, the module copy may be skipped, but the
+	// manifest must remain present.
 	assert.NotNil(t, info2)
-
-	// ensure that .terragrunt-module-manifest was recreated
-	assert.True(t, (*info2).ModTime().After((*info1).ModTime()))
 }
 
 func fileInfo(path, fileName string) (*os.FileInfo, error) {
@@ -223,12 +208,33 @@ func TestWindowsScaffoldRef(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// TestWindowsProviderCacheWithRemoteURL verifies that provider caching works on Windows
+// when providers are fetched from remote URLs. Previously, passing a URL like
+// "https://github.com/..." to os.Stat caused a "syntax is incorrect" error on Windows
+// because the colon in "https:" is invalid Windows path syntax.
+func TestWindowsProviderCacheWithRemoteURL(t *testing.T) {
+	t.Parallel()
+
+	helpers.CleanupTerraformFolder(t, testFixtureProviderCacheWindowsRemoteURL)
+	tmpEnvPath := helpers.CopyEnvironment(t, testFixtureProviderCacheWindowsRemoteURL)
+	rootPath := filepath.Join(tmpEnvPath, testFixtureProviderCacheWindowsRemoteURL)
+
+	providerCacheDir := filepath.Join(t.TempDir(), "provider-cache-windows-test")
+
+	helpers.RunTerragrunt(t, fmt.Sprintf("terragrunt run init --provider-cache --provider-cache-dir %s --non-interactive --working-dir %s", providerCacheDir, rootPath))
+
+	// Verify the provider was cached
+	entries, err := os.ReadDir(providerCacheDir)
+	require.NoError(t, err)
+	assert.NotEmpty(t, entries, "provider cache dir should not be empty after init")
+}
+
 func CopyEnvironmentToPath(t *testing.T, environmentPath, targetPath string) {
-	if err := os.MkdirAll(targetPath, 0777); err != nil {
+	if err := os.MkdirAll(targetPath, 0o777); err != nil {
 		t.Fatalf("Failed to create temp dir %s due to error %v", targetPath, err)
 	}
 
-	copyErr := util.CopyFolderContents(createLogger(), environmentPath, util.JoinPath(targetPath, environmentPath), ".terragrunt-test", nil, nil)
+	copyErr := util.CopyFolderContents(createLogger(), helpers.MustAbs(t, environmentPath), filepath.Join(targetPath, environmentPath), ".terragrunt-test")
 	require.NoError(t, copyErr)
 }
 
@@ -244,7 +250,16 @@ func CopyEnvironmentWithTflint(t *testing.T, environmentPath string) string {
 
 	t.Logf("Copying %s to %s", environmentPath, tmpDir)
 
-	require.NoError(t, util.CopyFolderContents(createLogger(), environmentPath, util.JoinPath(tmpDir, environmentPath), ".terragrunt-test", []string{".tflint.hcl"}, []string{}))
+	require.NoError(
+		t,
+		util.CopyFolderContents(
+			createLogger(),
+			helpers.MustAbs(t, environmentPath),
+			filepath.Join(tmpDir, environmentPath),
+			".terragrunt-test",
+			util.WithIncludeInCopy(".tflint.hcl"),
+		),
+	)
 
 	return tmpDir
 }

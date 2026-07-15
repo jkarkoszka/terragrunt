@@ -1,7 +1,7 @@
 package gcs
 
 import (
-	"github.com/gruntwork-io/terragrunt/internal/errors"
+	"github.com/gruntwork-io/terragrunt/internal/gcphelper"
 )
 
 // These are settings that can appear in the remote_state config that are ONLY used by Terragrunt and NOT forwarded
@@ -39,7 +39,7 @@ func (cfg *ExtendedRemoteStateConfigGCS) Validate() error {
 	// so we check it here to make sure we have handle to the bucket
 	// before we start validating the rest of the configuration.
 	if bucketName == "" {
-		return errors.New(MissingRequiredGCSRemoteStateConfig("bucket"))
+		return MissingRequiredGCSRemoteStateConfig("bucket")
 	}
 
 	return nil
@@ -62,4 +62,14 @@ type RemoteStateConfigGCS struct {
 // CacheKey returns a unique key for the given GCS config that can be used to cache the initialization.
 func (cfg *RemoteStateConfigGCS) CacheKey() string {
 	return cfg.Bucket
+}
+
+// GetGCPSessionConfig returns a GcpSessionConfig from the ExtendedRemoteStateConfigGCS configuration.
+func (cfg *ExtendedRemoteStateConfigGCS) GetGCPSessionConfig() *gcphelper.GCPSessionConfig {
+	return &gcphelper.GCPSessionConfig{
+		Credentials:                        cfg.RemoteStateConfigGCS.Credentials,
+		AccessToken:                        cfg.RemoteStateConfigGCS.AccessToken,
+		ImpersonateServiceAccount:          cfg.RemoteStateConfigGCS.ImpersonateServiceAccount,
+		ImpersonateServiceAccountDelegates: cfg.RemoteStateConfigGCS.ImpersonateServiceAccountDelegates,
+	}
 }

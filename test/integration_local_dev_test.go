@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/gruntwork-io/terragrunt/test/helpers"
-	"github.com/gruntwork-io/terragrunt/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,14 +20,10 @@ func TestTerragruntSourceMap(t *testing.T) {
 	t.Parallel()
 
 	fixtureSourceMapPath := filepath.Join("fixtures", "source-map")
+
+	// Clean the shared source fixture once up front; per-subtest CopyEnvironment
+	// calls then read from it concurrently without racing a parallel cleanup.
 	helpers.CleanupTerraformFolder(t, fixtureSourceMapPath)
-	tmpEnvPath := helpers.CopyEnvironment(t, fixtureSourceMapPath)
-	rootPath := filepath.Join(tmpEnvPath, fixtureSourceMapPath)
-	sourceMapArgs := fmt.Sprintf(
-		"--source-map %s --source-map %s",
-		"git::ssh://git@github.com/gruntwork-io/i-dont-exist.git="+tmpEnvPath,
-		"git::ssh://git@github.com/gruntwork-io/another-dont-exist.git="+tmpEnvPath,
-	)
 
 	testCases := []struct {
 		name     string
@@ -60,6 +55,14 @@ func TestTerragruntSourceMap(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
+			tmpEnvPath := helpers.CopyEnvironment(t, fixtureSourceMapPath)
+			rootPath := filepath.Join(tmpEnvPath, fixtureSourceMapPath)
+			sourceMapArgs := fmt.Sprintf(
+				"--source-map %s --source-map %s",
+				"git::ssh://git@github.com/gruntwork-io/i-dont-exist.git="+tmpEnvPath,
+				"git::ssh://git@github.com/gruntwork-io/another-dont-exist.git="+tmpEnvPath,
+			)
+
 			tgPath := filepath.Join(rootPath, tc.name)
 
 			action := "run"
@@ -67,7 +70,7 @@ func TestTerragruntSourceMap(t *testing.T) {
 				action = "run --all"
 			}
 
-			tgArgs := fmt.Sprintf("terragrunt %s --log-level trace --non-interactive --working-dir %s %s -- apply -auto-approve", action, tgPath, sourceMapArgs)
+			tgArgs := fmt.Sprintf("terragrunt %s --non-interactive --working-dir %s %s -- apply -auto-approve", action, tgPath, sourceMapArgs)
 			helpers.RunTerragrunt(t, tgArgs)
 		})
 	}
@@ -78,7 +81,7 @@ func TestGetTerragruntSourceHCL(t *testing.T) {
 
 	helpers.CleanupTerraformFolder(t, testFixtureGetTerragruntSourceHcl)
 	tmpEnvPath := helpers.CopyEnvironment(t, testFixtureGetTerragruntSourceHcl)
-	rootPath := util.JoinPath(tmpEnvPath, testFixtureGetTerragruntSourceHcl)
+	rootPath := filepath.Join(tmpEnvPath, testFixtureGetTerragruntSourceHcl)
 	terraformSource := "" // get_terragrunt_source_cli_flag() only returns the source when it is passed in via the CLI
 
 	helpers.RunTerragrunt(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
@@ -103,7 +106,7 @@ func TestGetTerragruntSourceCLI(t *testing.T) {
 
 	helpers.CleanupTerraformFolder(t, testFixtureGetTerragruntSourceCli)
 	tmpEnvPath := helpers.CopyEnvironment(t, testFixtureGetTerragruntSourceCli)
-	rootPath := util.JoinPath(tmpEnvPath, testFixtureGetTerragruntSourceCli)
+	rootPath := filepath.Join(tmpEnvPath, testFixtureGetTerragruntSourceCli)
 	terraformSource := "terraform_config_cli"
 
 	helpers.RunTerragrunt(t, fmt.Sprintf("terragrunt apply -auto-approve --non-interactive --working-dir %s --source %s", rootPath, terraformSource))

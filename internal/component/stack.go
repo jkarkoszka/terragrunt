@@ -1,10 +1,14 @@
 package component
 
 import (
+	"fmt"
+	"path/filepath"
 	"slices"
+	"sort"
+	"strings"
 	"sync"
 
-	"github.com/gruntwork-io/terragrunt/config"
+	"github.com/gruntwork-io/terragrunt/pkg/config"
 )
 
 const (
@@ -14,41 +18,46 @@ const (
 // Stack represents a discovered Terragrunt stack configuration.
 type Stack struct {
 	cfg              *config.StackConfig
+	discoveryContext *DiscoveryContext
 	path             string
 	reading          []string
-	discoveryContext *DiscoveryContext
 	dependencies     Components
 	dependents       Components
+	Units            []*Unit
+	mu               sync.Mutex
 	external         bool
-	mu               sync.RWMutex
 }
 
 // NewStack creates a new Stack component with the given path.
 func NewStack(path string) *Stack {
 	return &Stack{
-		path:         path,
-		dependencies: make(Components, 0),
-		dependents:   make(Components, 0),
+		path:             path,
+		discoveryContext: &DiscoveryContext{},
+		dependencies:     make(Components, 0),
+		dependents:       make(Components, 0),
 	}
 }
 
-// NewStackWithConfig creates a new Stack component with the given path and config.
-func NewStackWithConfig(path string, cfg *config.StackConfig) *Stack {
-	return &Stack{
-		cfg:          cfg,
-		path:         path,
-		dependencies: make(Components, 0),
-		dependents:   make(Components, 0),
-	}
+// WithDiscoveryContext sets the discovery context for this stack.
+func (s *Stack) WithDiscoveryContext(ctx *DiscoveryContext) *Stack {
+	s.discoveryContext = ctx
+
+	return s
 }
 
 // Config returns the parsed Stack configuration for this stack.
 func (s *Stack) Config() *config.StackConfig {
+	s.lock()
+	defer s.unlock()
+
 	return s.cfg
 }
 
 // StoreConfig stores the parsed Stack configuration for this stack.
 func (s *Stack) StoreConfig(cfg *config.StackConfig) {
+	s.lock()
+	defer s.unlock()
+
 	s.cfg = cfg
 }
 
@@ -67,6 +76,20 @@ func (s *Stack) SetPath(path string) {
 	s.path = path
 }
 
+// DisplayPath returns the path relative to DiscoveryContext.WorkingDir for display purposes.
+// Falls back to the original path if relative path calculation fails or WorkingDir is empty.
+func (s *Stack) DisplayPath() string {
+	if s.discoveryContext == nil || s.discoveryContext.WorkingDir == "" {
+		return s.path
+	}
+
+	if rel, err := filepath.Rel(s.discoveryContext.WorkingDir, s.path); err == nil {
+		return rel
+	}
+
+	return s.path
+}
+
 // External returns whether the component is external.
 func (s *Stack) External() bool {
 	return s.external
@@ -79,11 +102,17 @@ func (s *Stack) SetExternal() {
 
 // Reading returns the list of files being read by this component.
 func (s *Stack) Reading() []string {
+	s.lock()
+	defer s.unlock()
+
 	return s.reading
 }
 
 // SetReading sets the list of files being read by this component.
 func (s *Stack) SetReading(files ...string) {
+	s.lock()
+	defer s.unlock()
+
 	s.reading = files
 }
 
@@ -92,6 +121,11 @@ func (s *Stack) SetReading(files ...string) {
 // Stacks don't support leveraging sources right now, so we just return an empty list.
 func (s *Stack) Sources() []string {
 	return []string{}
+}
+
+// ConfigFile returns the config filename for this stack.
+func (s *Stack) ConfigFile() string {
+	return config.DefaultStackFile
 }
 
 // DiscoveryContext returns the discovery context for this component.
@@ -104,6 +138,15 @@ func (s *Stack) SetDiscoveryContext(ctx *DiscoveryContext) {
 	s.discoveryContext = ctx
 }
 
+// Origin returns the origin of the discovery context for this component.
+func (s *Stack) Origin() Origin {
+	if s.discoveryContext == nil {
+		return OriginUnknown
+	}
+
+	return s.discoveryContext.Origin()
+}
+
 // lock locks the Stack.
 func (s *Stack) lock() {
 	s.mu.Lock()
@@ -112,16 +155,6 @@ func (s *Stack) lock() {
 // unlock unlocks the Stack.
 func (s *Stack) unlock() {
 	s.mu.Unlock()
-}
-
-// rLock locks the Stack for reading.
-func (s *Stack) rLock() {
-	s.mu.RLock()
-}
-
-// rUnlock unlocks the Stack for reading.
-func (s *Stack) rUnlock() {
-	s.mu.RUnlock()
 }
 
 // AddDependency adds a dependency to the Stack and vice versa.
@@ -168,16 +201,50 @@ func (s *Stack) AddDependent(dependent Component) {
 
 // Dependencies returns the dependencies of the Stack.
 func (s *Stack) Dependencies() Components {
-	s.rLock()
-	defer s.rUnlock()
+	s.lock()
+	defer s.unlock()
 
 	return s.dependencies
 }
 
 // Dependents returns the dependents of the Stack.
 func (s *Stack) Dependents() Components {
-	s.rLock()
-	defer s.rUnlock()
+	s.lock()
+	defer s.unlock()
 
 	return s.dependents
+}
+
+// String renders this stack as a human-readable string.
+//
+// Example output:
+//
+//	Stack at /path/to/stack:
+//	  => Unit /path/to/unit1 (excluded: false, assume applied: false, dependencies: [/dep1])
+//	  => Unit /path/to/unit2 (excluded: true, assume applied: false, dependencies: [])
+func (s *Stack) String() string {
+	units := make([]string, 0, len(s.Units))
+	for _, unit := range s.Units {
+		units = append(units, "  => "+unit.String())
+	}
+
+	sort.Strings(units)
+
+	workingDir := s.path
+	if s.discoveryContext != nil && s.discoveryContext.WorkingDir != "" {
+		workingDir = s.discoveryContext.WorkingDir
+	}
+
+	return fmt.Sprintf("Stack at %s:\n%s", workingDir, strings.Join(units, "\n"))
+}
+
+// FindUnitByPath finds a unit in the stack by its path.
+func (s *Stack) FindUnitByPath(path string) *Unit {
+	for _, unit := range s.Units {
+		if unit.Path() == path {
+			return unit
+		}
+	}
+
+	return nil
 }

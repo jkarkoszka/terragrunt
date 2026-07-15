@@ -3,7 +3,7 @@ terraform {
 
   required_providers {
     null = {
-      source  = "hashicorp/null"
+      source  = "registry.opentofu.org/hashicorp/null"
       version = "~> 3.2.4"
     }
   }
@@ -29,6 +29,6 @@ output "test" {
 }
 
 module "remote" {
-  source = "github.com/gruntwork-io/terragrunt.git//test/fixtures/download/hello-world-no-remote?ref=v0.93.2"
+  source = "git::__MIRROR_URL__//test/fixtures/download/hello-world-no-remote?ref=v0.93.2"
   name   = var.name
 }

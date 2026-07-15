@@ -3,13 +3,13 @@ package test_test
 import (
 	"bytes"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gruntwork-io/terragrunt/test/helpers"
-	"github.com/gruntwork-io/terragrunt/util"
 )
 
 const (
@@ -22,9 +22,9 @@ const (
 func TestFeatureFlagDefaults(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testSimpleFlag)
+	helpers.CleanupTerraformFolder(t, testSimpleFlag)
 	tmpEnvPath := helpers.CopyEnvironment(t, testSimpleFlag)
-	rootPath := util.JoinPath(tmpEnvPath, testSimpleFlag)
+	rootPath := filepath.Join(tmpEnvPath, testSimpleFlag)
 
 	helpers.RunTerragrunt(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -34,9 +34,9 @@ func TestFeatureFlagDefaults(t *testing.T) {
 func TestFeatureFlagCli(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testSimpleFlag)
+	helpers.CleanupTerraformFolder(t, testSimpleFlag)
 	tmpEnvPath := helpers.CopyEnvironment(t, testSimpleFlag)
-	rootPath := util.JoinPath(tmpEnvPath, testSimpleFlag)
+	rootPath := filepath.Join(tmpEnvPath, testSimpleFlag)
 
 	helpers.RunTerragrunt(t, "terragrunt apply -auto-approve --feature int_feature_flag=777 --feature bool_feature_flag=true --feature string_feature_flag=tomato --non-interactive --working-dir "+rootPath)
 
@@ -50,9 +50,9 @@ func TestFeatureFlagCli(t *testing.T) {
 func TestFeatureApplied(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testSimpleFlag)
+	helpers.CleanupTerraformFolder(t, testSimpleFlag)
 	tmpEnvPath := helpers.CopyEnvironment(t, testSimpleFlag)
-	rootPath := util.JoinPath(tmpEnvPath, testSimpleFlag)
+	rootPath := filepath.Join(tmpEnvPath, testSimpleFlag)
 
 	stdout, _, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --feature bool_feature_flag=true --non-interactive --working-dir "+rootPath)
 	require.NoError(t, err)
@@ -66,9 +66,9 @@ func TestFeatureApplied(t *testing.T) {
 func TestFeatureFlagEnv(t *testing.T) {
 	t.Setenv("TG_FEATURE", "int_feature_flag=111,bool_feature_flag=true,string_feature_flag=xyz")
 
-	cleanupTerraformFolder(t, testSimpleFlag)
+	helpers.CleanupTerraformFolder(t, testSimpleFlag)
 	tmpEnvPath := helpers.CopyEnvironment(t, testSimpleFlag)
-	rootPath := util.JoinPath(tmpEnvPath, testSimpleFlag)
+	rootPath := filepath.Join(tmpEnvPath, testSimpleFlag)
 
 	helpers.RunTerragrunt(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -82,11 +82,11 @@ func TestFeatureFlagEnv(t *testing.T) {
 func TestFeatureIncludeFlag(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testIncludeFlag)
+	helpers.CleanupTerraformFolder(t, testIncludeFlag)
 	tmpEnvPath := helpers.CopyEnvironment(t, testIncludeFlag)
-	rootPath := util.JoinPath(tmpEnvPath, testIncludeFlag, "app")
+	rootPath := filepath.Join(tmpEnvPath, testIncludeFlag, "app")
 
-	helpers.RunTerragrunt(t, "terragrunt apply -auto-approve --log-level trace --non-interactive --working-dir "+rootPath)
+	helpers.RunTerragrunt(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
 	validateOutputs(t, rootPath)
 }
@@ -94,11 +94,11 @@ func TestFeatureIncludeFlag(t *testing.T) {
 func TestFeatureFlagRunAll(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testRunAllFlag)
+	helpers.CleanupTerraformFolder(t, testRunAllFlag)
 	tmpEnvPath := helpers.CopyEnvironment(t, testRunAllFlag)
-	rootPath := util.JoinPath(tmpEnvPath, testRunAllFlag)
-	app1 := util.JoinPath(tmpEnvPath, testRunAllFlag, "app1")
-	app2 := util.JoinPath(tmpEnvPath, testRunAllFlag, "app2")
+	rootPath := filepath.Join(tmpEnvPath, testRunAllFlag)
+	app1 := filepath.Join(tmpEnvPath, testRunAllFlag, "app1")
+	app2 := filepath.Join(tmpEnvPath, testRunAllFlag, "app2")
 
 	helpers.RunTerragrunt(t, "terragrunt run --all --non-interactive --working-dir "+rootPath+" -- apply -auto-approve")
 
@@ -109,9 +109,9 @@ func TestFeatureFlagRunAll(t *testing.T) {
 func TestFailOnEmptyFeatureFlag(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testErrorEmptyFlag)
+	helpers.CleanupTerraformFolder(t, testErrorEmptyFlag)
 	tmpEnvPath := helpers.CopyEnvironment(t, testErrorEmptyFlag)
-	rootPath := util.JoinPath(tmpEnvPath, testErrorEmptyFlag)
+	rootPath := filepath.Join(tmpEnvPath, testErrorEmptyFlag)
 
 	_, _, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 	require.Error(t, err)

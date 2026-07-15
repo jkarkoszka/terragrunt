@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/gruntwork-io/terragrunt/test/helpers"
-	"github.com/gruntwork-io/terragrunt/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,9 +29,9 @@ const (
 func TestErrorsHandling(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testSimpleErrors)
+	helpers.CleanupTerraformFolder(t, testSimpleErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testSimpleErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testSimpleErrors)
+	rootPath := filepath.Join(tmpEnvPath, testSimpleErrors)
 
 	_, _, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -42,9 +41,9 @@ func TestErrorsHandling(t *testing.T) {
 func TestIgnoreError(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testIgnoreErrors)
+	helpers.CleanupTerraformFolder(t, testIgnoreErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testIgnoreErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testIgnoreErrors)
+	rootPath := filepath.Join(tmpEnvPath, testIgnoreErrors)
 
 	_, stderr, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -56,9 +55,9 @@ func TestIgnoreError(t *testing.T) {
 func TestRunAllIgnoreError(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testRunAllIgnoreErrors)
+	helpers.CleanupTerraformFolder(t, testRunAllIgnoreErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testRunAllIgnoreErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testRunAllIgnoreErrors)
+	rootPath := filepath.Join(tmpEnvPath, testRunAllIgnoreErrors)
 
 	stdout, stderr, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt run --all --non-interactive --working-dir "+rootPath+" -- apply -auto-approve")
 
@@ -71,9 +70,9 @@ func TestRunAllIgnoreError(t *testing.T) {
 func TestRetryError(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testRetryErrors)
+	helpers.CleanupTerraformFolder(t, testRetryErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testRetryErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testRetryErrors)
+	rootPath := filepath.Join(tmpEnvPath, testRetryErrors)
 
 	_, stderr, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -85,9 +84,9 @@ func TestRetryError(t *testing.T) {
 func TestRetryFailError(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testRetryFailErrors)
+	helpers.CleanupTerraformFolder(t, testRetryFailErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testRetryFailErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testRetryFailErrors)
+	rootPath := filepath.Join(tmpEnvPath, testRetryFailErrors)
 
 	_, stderr, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -98,9 +97,9 @@ func TestRetryFailError(t *testing.T) {
 func TestIgnoreSignal(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testIgnoreSignalErrors)
+	helpers.CleanupTerraformFolder(t, testIgnoreSignalErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testIgnoreSignalErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testIgnoreSignalErrors)
+	rootPath := filepath.Join(tmpEnvPath, testIgnoreSignalErrors)
 
 	_, stderr, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -108,6 +107,7 @@ func TestIgnoreSignal(t *testing.T) {
 	assert.Contains(t, stderr, "Ignoring error example1")
 	assert.NotContains(t, stderr, "Ignoring error example2")
 
+	// Signals file is written to original config directory (opts.WorkingDir during error handling)
 	signalsFile := filepath.Join(rootPath, "error-signals.json")
 	assert.FileExists(t, signalsFile)
 
@@ -126,9 +126,9 @@ func TestIgnoreSignal(t *testing.T) {
 func TestRunAllError(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testRunAllErrors)
+	helpers.CleanupTerraformFolder(t, testRunAllErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testRunAllErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testRunAllErrors)
+	rootPath := filepath.Join(tmpEnvPath, testRunAllErrors)
 
 	_, stderr, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt run --all --non-interactive --working-dir "+rootPath+" -- apply -auto-approve")
 
@@ -141,20 +141,23 @@ func TestRunAllError(t *testing.T) {
 func TestRunAllFail(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testRunAllErrors)
+	helpers.CleanupTerraformFolder(t, testRunAllErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testRunAllErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testRunAllErrors)
+	rootPath := filepath.Join(tmpEnvPath, testRunAllErrors)
 
-	_, _, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt run --all --feature unstable=false --non-interactive --working-dir "+rootPath+" -- apply -auto-approve")
-	require.NoError(t, err)
+	_, _, err := helpers.RunTerragruntCommandWithOutput(
+		t,
+		"terragrunt run --all --feature unstable=false --non-interactive --working-dir "+rootPath+" -- apply -auto-approve",
+	)
+	require.Error(t, err)
 }
 
 func TestIgnoreNegativePattern(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testNegativePatternErrors)
+	helpers.CleanupTerraformFolder(t, testNegativePatternErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testNegativePatternErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testNegativePatternErrors)
+	rootPath := filepath.Join(tmpEnvPath, testNegativePatternErrors)
 
 	_, stdout, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -165,9 +168,9 @@ func TestIgnoreNegativePattern(t *testing.T) {
 func TestHandleMultiLineErrors(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testMultiLineErrors)
+	helpers.CleanupTerraformFolder(t, testMultiLineErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testMultiLineErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testMultiLineErrors)
+	rootPath := filepath.Join(tmpEnvPath, testMultiLineErrors)
 
 	_, stdout, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -178,9 +181,9 @@ func TestHandleMultiLineErrors(t *testing.T) {
 func TestGetDefaultRetryableErrors(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testGetDefaultErrors)
+	helpers.CleanupTerraformFolder(t, testGetDefaultErrors)
 	tmpEnvPath := helpers.CopyEnvironment(t, testGetDefaultErrors)
-	rootPath := util.JoinPath(tmpEnvPath, testGetDefaultErrors)
+	rootPath := filepath.Join(tmpEnvPath, testGetDefaultErrors)
 
 	helpers.RunTerragrunt(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)
 
@@ -202,20 +205,21 @@ func TestGetDefaultRetryableErrors(t *testing.T) {
 func TestNoAutoRetryFlag(t *testing.T) {
 	t.Parallel()
 
-	cleanupTerraformFolder(t, testNoAutoRetry)
+	helpers.CleanupTerraformFolder(t, testNoAutoRetry)
 	tmpEnvPath := helpers.CopyEnvironment(t, testNoAutoRetry)
-	rootPath := util.JoinPath(tmpEnvPath, testNoAutoRetry)
+	rootPath := filepath.Join(tmpEnvPath, testNoAutoRetry)
 
 	// Test with --no-auto-retry flag - should fail without retry
 	_, stderr, err := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --no-auto-retry --non-interactive --working-dir "+rootPath)
 	require.Error(t, err)
 	assert.Contains(t, stderr, "Transient error")
 
-	// Cleanup for second test
-	successFile := filepath.Join(rootPath, "success.txt")
+	// Cleanup for second test - success.txt is created in cache directory (default hook behavior)
+	cacheDir := helpers.FindCacheWorkingDir(t, rootPath)
+	successFile := filepath.Join(cacheDir, "success.txt")
 	err = os.Remove(successFile)
 	require.NoError(t, err)
-	cleanupTerraformFolder(t, testNoAutoRetry)
+	helpers.CleanupTerraformFolder(t, testNoAutoRetry)
 
 	// Test without flag - should succeed with retry
 	_, stderr2, err2 := helpers.RunTerragruntCommandWithOutput(t, "terragrunt apply -auto-approve --non-interactive --working-dir "+rootPath)

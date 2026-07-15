@@ -3,11 +3,11 @@ package remotestate
 import (
 	"fmt"
 
-	"github.com/gruntwork-io/terragrunt/codegen"
+	"errors"
+
+	"github.com/gruntwork-io/terragrunt/internal/codegen"
 	"github.com/gruntwork-io/terragrunt/internal/ctyhelper"
-	"github.com/gruntwork-io/terragrunt/internal/errors"
 	"github.com/gruntwork-io/terragrunt/internal/remotestate/backend"
-	"github.com/gruntwork-io/terragrunt/options"
 	"github.com/gruntwork-io/terragrunt/pkg/log"
 	"github.com/zclconf/go-cty/cty"
 )
@@ -49,16 +49,16 @@ func (cfg *Config) String() string {
 // Validate validates that the remote state is configured correctly.
 func (cfg *Config) Validate() error {
 	if cfg.BackendName == "" {
-		return errors.New(ErrRemoteBackendMissing)
+		return ErrRemoteBackendMissing
 	}
 
 	return nil
 }
 
 // GenerateOpenTofuCode generates the OpenTofu/Terraform code for configuring remote state backend.
-func (cfg *Config) GenerateOpenTofuCode(l log.Logger, opts *options.TerragruntOptions, backendConfig map[string]any) error {
+func (cfg *Config) GenerateOpenTofuCode(l log.Logger, workingDir string, backendConfig map[string]any) error {
 	if cfg.Generate == nil {
-		return errors.New(ErrGenerateCalledWithNoGenerateAttr)
+		return ErrGenerateCalledWithNoGenerateAttr
 	}
 
 	switch {
@@ -92,7 +92,7 @@ func (cfg *Config) GenerateOpenTofuCode(l log.Logger, opts *options.TerragruntOp
 		CommentPrefix: codegen.DefaultCommentPrefix,
 	}
 
-	return codegen.WriteToFile(l, opts, opts.WorkingDir, codegenConfig)
+	return codegen.WriteToFile(l, workingDir, &codegenConfig)
 }
 
 type ConfigFileGenerate struct {

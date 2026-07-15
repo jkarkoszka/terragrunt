@@ -4,7 +4,6 @@ package placeholders
 import (
 	"strings"
 
-	"github.com/gruntwork-io/terragrunt/internal/errors"
 	"github.com/gruntwork-io/terragrunt/pkg/log/format/options"
 )
 
@@ -33,7 +32,9 @@ func NewPlaceholderRegister() Placeholders {
 		Time(),
 		Level(),
 		Message(),
-		Field(WorkDirKeyName, options.PathFormat(options.NonePath, options.RelativePath, options.ShortRelativePath, options.ShortPath)),
+		Field(WorkDirKeyName, options.PathFormat(
+			options.NonePath, options.RelativePath, options.ShortRelativePath, options.ShortPath,
+		)),
 		Field(TFPathKeyName, options.PathFormat(options.NonePath, options.FilenamePath, options.DirectoryPath)),
 		Field(TFCmdArgsKeyName),
 		Field(TFCmdKeyName),
@@ -66,14 +67,18 @@ func (phs Placeholders) Names() []string {
 func (phs Placeholders) Format(data *options.Data) (string, error) {
 	var str string
 
+	var strSb69 strings.Builder
+
 	for _, ph := range phs {
 		s, err := ph.Format(data)
 		if err != nil {
 			return "", err
 		}
 
-		str += s
+		strSb69.WriteString(s)
 	}
+
+	str += strSb69.String()
 
 	return str, nil
 }
@@ -139,12 +144,12 @@ func Parse(str string) (Placeholders, error) {
 
 		placeholder, str = placeholderRegister.findPlaceholder(str)
 		if placeholder == nil {
-			return nil, errors.New(NewInvalidPlaceholderNameError(str, placeholderRegister))
+			return nil, NewInvalidPlaceholderNameError(str, placeholderRegister)
 		}
 
 		str, err = placeholder.Options().Configure(str)
 		if err != nil {
-			return nil, errors.New(NewInvalidPlaceholderOptionError(placeholder, err))
+			return nil, NewInvalidPlaceholderOptionError(placeholder, err)
 		}
 
 		placeholders = append(placeholders, placeholder)
@@ -177,7 +182,8 @@ func findPlaintextPlaceholder(str string) (Placeholder, string) { //nolint:iretu
 	return nil, str
 }
 
-// isPlaceholderNameCharacter returns true if the given character `c` does not contain any restricted characters for placeholder names.
+// isPlaceholderNameCharacter returns true if the given character `c` does not
+// contain any restricted characters for placeholder names.
 //
 // e.g. "time" return `true`.
 // e.g. "time " return `false`.

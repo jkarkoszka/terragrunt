@@ -1,21 +1,26 @@
-s3:
+S3:
   timeout: 1h
   include:
     names_regex:
+      - "^terragrunt-test-[a-zA-Z0-9]{6}.*"
       - "^terragrunt-test-bucket-[a-zA-Z0-9]{6}.*"
+      - "^terragrunt-terralith-tfstate-[a-zA-Z0-9]{6}.*"
+      - "^terragrunt-terralith-project-[a-zA-Z0-9]{6}.*"
+      - "^terragrunt-getter-test-[a-zA-Z0-9]{6}.*"
+      - "^terragrunt-cas-test-[a-zA-Z0-9]{6}.*"
 
-vpc:
+VPC:
   include:
-    name_regex:
+    names_regex:
       - "^vpc-.*"
       - "^step-.*"
 
-ec2:
+EC2:
   include:
-    name_regex:
+    names_regex:
       - "^single-instance$"
 
-dynamodb:
+DynamoDB:
   include:
-    table_names_regex:
+    names_regex:
       - "^terragrunt-test.*"

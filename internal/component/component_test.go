@@ -1,9 +1,12 @@
 package component_test
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gruntwork-io/terragrunt/internal/component"
+	"github.com/gruntwork-io/terragrunt/pkg/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -74,6 +77,7 @@ func TestComponentsCycleCheck(t *testing.T) {
 				a := component.NewUnit("a")
 				b := component.NewUnit("b")
 				a.AddDependency(b)
+
 				return component.Components{a, b}
 			},
 			errorExpected: false,
@@ -85,6 +89,7 @@ func TestComponentsCycleCheck(t *testing.T) {
 				b := component.NewUnit("b")
 				a.AddDependency(b)
 				b.AddDependency(a)
+
 				return component.Components{a, b}
 			},
 			errorExpected: true,
@@ -95,9 +100,11 @@ func TestComponentsCycleCheck(t *testing.T) {
 				a := component.NewUnit("a")
 				b := component.NewUnit("b")
 				c := component.NewUnit("c")
+
 				a.AddDependency(b)
 				b.AddDependency(c)
 				c.AddDependency(a)
+
 				return component.Components{a, b, c}
 			},
 			errorExpected: true,
@@ -109,10 +116,12 @@ func TestComponentsCycleCheck(t *testing.T) {
 				b := component.NewUnit("b")
 				c := component.NewUnit("c")
 				d := component.NewUnit("d")
+
 				a.AddDependency(b)
 				a.AddDependency(c)
 				b.AddDependency(d)
 				c.AddDependency(d)
+
 				return component.Components{a, b, c, d}
 			},
 			errorExpected: false,
@@ -136,4 +145,126 @@ func TestComponentsCycleCheck(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUnitStringConcurrent(t *testing.T) {
+	t.Parallel()
+
+	unit := component.NewUnit("/test/path")
+	dep := component.NewUnit("/test/dep")
+	unit.AddDependency(dep)
+
+	var wg sync.WaitGroup
+
+	const goroutines = 10
+
+	for range goroutines {
+		wg.Go(func() {
+			for range 100 {
+				s := unit.String()
+				assert.Contains(t, s, "/test/path")
+			}
+		})
+	}
+
+	wg.Wait()
+}
+
+func TestThreadSafeComponentsEnsureNoDuplicates(t *testing.T) {
+	t.Parallel()
+
+	tsc := component.NewThreadSafeComponents(component.Components{})
+
+	// Add same path twice - should not duplicate
+	unit1 := component.NewUnit("/test/path")
+	unit2 := component.NewUnit("/test/path")
+
+	added1, wasAdded1 := tsc.EnsureComponent(unit1)
+	added2, wasAdded2 := tsc.EnsureComponent(unit2)
+
+	assert.True(t, wasAdded1, "first component should be added")
+	assert.False(t, wasAdded2, "second component should not be added (duplicate)")
+	assert.Same(t, added1, added2, "should return same component instance")
+	assert.Equal(t, 1, tsc.Len(), "should have exactly one component")
+}
+
+func TestThreadSafeComponentsFindByPath(t *testing.T) {
+	t.Parallel()
+
+	unit := component.NewUnit("/test/path")
+	tsc := component.NewThreadSafeComponents(component.Components{unit})
+
+	// Find by exact path
+	found := tsc.FindByPath("/test/path")
+	assert.NotNil(t, found, "should find component by exact path")
+	assert.Equal(t, "/test/path", found.Path())
+
+	// Find non-existent path
+	notFound := tsc.FindByPath("/nonexistent")
+	assert.Nil(t, notFound, "should not find non-existent path")
+}
+
+func TestThreadSafeComponentsConcurrentAccess(t *testing.T) {
+	t.Parallel()
+
+	tsc := component.NewThreadSafeComponents(component.Components{})
+
+	var wg sync.WaitGroup
+
+	const goroutines = 10
+
+	// Concurrent writes tests
+	for range goroutines {
+		wg.Go(func() {
+			unit := component.NewUnit("/test/path")
+			tsc.EnsureComponent(unit)
+		})
+	}
+
+	// Concurrent reads
+	for range goroutines {
+		wg.Go(func() {
+			for range 100 {
+				_ = tsc.FindByPath("/test/path")
+				_ = tsc.Len()
+				_ = tsc.ToComponents()
+			}
+		})
+	}
+
+	wg.Wait()
+
+	// Should have exactly one component despite concurrent adds
+	assert.Equal(t, 1, tsc.Len(), "should have exactly one component after concurrent adds")
+}
+
+// TestUnitGuardConfigParseWithRacing verifies the parse runs exactly once when
+// many goroutines race to parse the same unit.
+func TestUnitGuardConfigParseWithRacing(t *testing.T) {
+	t.Parallel()
+
+	unit := component.NewUnit("/test/unit")
+
+	var parses atomic.Int32
+
+	var wg sync.WaitGroup
+
+	const goroutines = 32
+
+	for range goroutines {
+		wg.Go(func() {
+			err := unit.GuardConfigParse(func() error {
+				parses.Add(1)
+				unit.StoreConfig(&config.TerragruntConfig{})
+
+				return nil
+			})
+			assert.NoError(t, err)
+		})
+	}
+
+	wg.Wait()
+
+	assert.Equal(t, int32(1), parses.Load(), "config should be parsed exactly once")
+	assert.NotNil(t, unit.Config(), "config should be populated after parsing")
 }

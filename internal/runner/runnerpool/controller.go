@@ -2,30 +2,35 @@ package runnerpool
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
-	"github.com/gruntwork-io/terragrunt/options"
+	"github.com/gruntwork-io/terragrunt/pkg/options"
 
-	"github.com/gruntwork-io/terragrunt/internal/errors"
+	"errors"
+
+	"github.com/gruntwork-io/terragrunt/internal/component"
+	"github.com/gruntwork-io/terragrunt/internal/multierror"
 
 	"github.com/gruntwork-io/terragrunt/pkg/log"
 
 	"github.com/gruntwork-io/terragrunt/internal/queue"
-	"github.com/gruntwork-io/terragrunt/internal/runner/common"
-	"github.com/gruntwork-io/terragrunt/telemetry"
+	"github.com/gruntwork-io/terragrunt/internal/telemetry"
 
-	"github.com/puzpuzpuz/xsync/v3"
+	"github.com/puzpuzpuz/xsync/v4"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // UnitRunner defines a function type that executes a Unit within a given context and returns an error.
-type UnitRunner func(ctx context.Context, u *common.Unit) error
+type UnitRunner func(ctx context.Context, u *component.Unit) error
 
 // Controller orchestrates concurrent execution over a DAG.
 type Controller struct {
 	q           *queue.Queue
 	runner      UnitRunner
 	readyCh     chan struct{}
-	unitsMap    map[string]*common.Unit
+	unitsMap    map[string]*component.Unit
 	concurrency int
 }
 
@@ -51,18 +56,18 @@ func WithMaxConcurrency(concurrency int) ControllerOption {
 }
 
 // NewController creates a new Controller with the given options and a pre-built queue.
-func NewController(q *queue.Queue, units []*common.Unit, opts ...ControllerOption) *Controller {
+func NewController(q *queue.Queue, units []*component.Unit, opts ...ControllerOption) *Controller {
 	dr := &Controller{
 		q:           q,
 		readyCh:     make(chan struct{}, 1), // buffered to avoid blocking
 		concurrency: options.DefaultParallelism,
 	}
 	// Map to link runner Units and Queue Entries
-	unitsMap := make(map[string]*common.Unit)
+	unitsMap := make(map[string]*component.Unit)
 
 	for _, u := range units {
-		if u != nil && u.Path != "" {
-			unitsMap[u.Path] = u
+		if u != nil && u.Path() != "" {
+			unitsMap[u.Path()] = u
 		}
 	}
 
@@ -90,11 +95,11 @@ func (dr *Controller) Run(ctx context.Context, l log.Logger) error {
 		var (
 			wg      sync.WaitGroup
 			sem     = make(chan struct{}, dr.concurrency)
-			results = xsync.NewMapOf[string, error]()
+			results = xsync.NewMap[string, error]()
 		)
 
 		if dr.runner == nil {
-			return errors.Errorf("Runner Pool Controller: runner is not set, cannot run")
+			return errors.New("runner Pool Controller: runner is not set, cannot run")
 		}
 
 		l.Debugf("Runner Pool Controller: starting with %d tasks, concurrency %d",
@@ -107,13 +112,16 @@ func (dr *Controller) Run(ctx context.Context, l log.Logger) error {
 		}
 
 		for {
-			readyEntries := dr.q.GetReadyWithDependencies()
+			readyEntries := dr.q.GetReadyWithDependencies(l)
 			l.Debugf("Runner Pool Controller: found %d readyEntries tasks", len(readyEntries))
 
 			for _, e := range readyEntries {
-				// log debug which entry is running
+				if !dr.q.ClaimForRunning(e) {
+					l.Debugf("Runner Pool Controller: skipping %s; fail-fast cancelled before dispatch", e.Component.Path())
+					continue
+				}
+
 				l.Debugf("Runner Pool Controller: running %s", e.Component.Path())
-				dr.q.SetEntryStatus(e, queue.StatusRunning)
 
 				sem <- struct{}{}
 
@@ -132,7 +140,7 @@ func (dr *Controller) Run(ctx context.Context, l log.Logger) error {
 
 					unit := dr.unitsMap[ent.Component.Path()]
 					if unit == nil {
-						err := errors.Errorf("unit for path %s not found in discovered units", ent.Component.Path())
+						err := fmt.Errorf("unit for path %s not found in discovered units", ent.Component.Path())
 						l.Errorf("Runner Pool Controller: unit for path %s not found in discovered units, skipping execution", ent.Component.Path())
 						dr.q.FailEntry(ent)
 						results.Store(ent.Component.Path(), err)
@@ -155,7 +163,7 @@ func (dr *Controller) Run(ctx context.Context, l log.Logger) error {
 				}(e)
 			}
 
-			if len(readyEntries) == 0 && len(sem) == 0 {
+			if dr.q.Finished() {
 				break
 			}
 
@@ -169,29 +177,50 @@ func (dr *Controller) Run(ctx context.Context, l log.Logger) error {
 
 		wg.Wait()
 
-		// Collect errors from results map and check for errors
-		errCollector := &errors.MultiError{}
+		var errCollector []error
+
+		var succeeded, failed, earlyExit int
 
 		for _, entry := range dr.q.Entries {
+			switch entry.Status {
+			case queue.StatusSucceeded:
+				succeeded++
+			case queue.StatusFailed:
+				failed++
+			case queue.StatusEarlyExit:
+				earlyExit++
+			case queue.StatusPending, queue.StatusBlocked, queue.StatusUnsorted, queue.StatusReady, queue.StatusRunning:
+				// Non-terminal states are not counted in the summary.
+			}
+
 			if err, ok := results.Load(entry.Component.Path()); ok {
 				if err == nil {
 					continue
 				}
 
-				errCollector = errCollector.Append(err)
+				errCollector = append(errCollector, err)
 
 				continue
 			}
 
 			if entry.Status == queue.StatusEarlyExit {
-				errCollector = errCollector.Append(errors.Errorf("unit %s did not run due to early exit", entry.Component.Path()))
+				failedDep := findFailedDependency(entry, dr.q)
+				errCollector = append(errCollector, NewUnitEarlyExitError(entry.Component.Path(), failedDep))
 			}
 
 			if entry.Status == queue.StatusFailed {
-				errCollector = errCollector.Append(errors.Errorf("unit %s failed to run", entry.Component.Path()))
+				errCollector = append(errCollector, NewUnitFailedError(entry.Component.Path()))
 			}
 		}
 
-		return errCollector.ErrorOrNil()
+		if span := trace.SpanFromContext(childCtx); span.IsRecording() {
+			span.SetAttributes(
+				attribute.Int("tasks_succeeded", succeeded),
+				attribute.Int("tasks_failed", failed),
+				attribute.Int("tasks_early_exit", earlyExit),
+			)
+		}
+
+		return multierror.Join(errCollector...)
 	})
 }

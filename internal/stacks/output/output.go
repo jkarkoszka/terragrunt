@@ -4,17 +4,41 @@ package output
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 
-	"github.com/gruntwork-io/terragrunt/config"
-	"github.com/gruntwork-io/terragrunt/internal/errors"
+	"errors"
+
+	"github.com/gruntwork-io/terragrunt/internal/configbridge"
 	"github.com/gruntwork-io/terragrunt/internal/stacks/generate"
-	"github.com/gruntwork-io/terragrunt/options"
+	"github.com/gruntwork-io/terragrunt/internal/telemetry"
+	"github.com/gruntwork-io/terragrunt/internal/venv"
+	"github.com/gruntwork-io/terragrunt/internal/worker"
+	"github.com/gruntwork-io/terragrunt/internal/worktrees"
+	"github.com/gruntwork-io/terragrunt/pkg/config"
 	"github.com/gruntwork-io/terragrunt/pkg/log"
-	"github.com/gruntwork-io/terragrunt/telemetry"
+	"github.com/gruntwork-io/terragrunt/pkg/options"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/zclconf/go-cty/cty"
 )
+
+// UnitOutputError is returned when reading terraform outputs for a stack unit fails.
+type UnitOutputError struct {
+	Err      error
+	UnitName string
+	UnitDir  string
+}
+
+func (e UnitOutputError) Error() string {
+	return fmt.Sprintf("failed to read outputs for unit %s in %s: %v", e.UnitName, e.UnitDir, e.Err)
+}
+
+func (e UnitOutputError) Unwrap() error {
+	return e.Err
+}
 
 // StackOutput collects and returns the OpenTofu/Terraform output values for all declared units in a stack hierarchy.
 //
@@ -49,12 +73,32 @@ import (
 //
 // Errors can occur during stack file listing, value reading, stack config parsing, output reading,
 // or when converting the final output structure to cty.Value format.
-func StackOutput(ctx context.Context, l log.Logger, opts *options.TerragruntOptions) (cty.Value, error) {
+func StackOutput(
+	ctx context.Context,
+	l log.Logger,
+	v venv.Venv,
+	opts *options.TerragruntOptions,
+) (cty.Value, error) {
 	l.Debugf("Generating output from %s", opts.WorkingDir)
 
-	foundFiles, err := generate.ListStackFilesMaybeWithDiscovery(ctx, l, opts, opts.WorkingDir)
+	// Create worktrees internally if filter-flag experiment is enabled and git filters are present
+	wts, err := buildWorktreesIfNeeded(ctx, l, opts)
 	if err != nil {
-		return cty.NilVal, errors.Errorf("Failed to list stack files in %s: %w", opts.WorkingDir, err)
+		return cty.NilVal, fmt.Errorf("failed to create worktrees: %w", err)
+	}
+
+	if wts != nil {
+		defer func() {
+			if cleanupErr := wts.Cleanup(ctx, l); cleanupErr != nil {
+				l.Errorf("failed to cleanup worktrees: %v", cleanupErr)
+			}
+		}()
+	}
+
+	// Single discovery walk returns both stack files and excluded unit paths.
+	foundFiles, excludedPaths, err := generate.ListStackFilesWithExcludes(ctx, l, v, opts, wts)
+	if err != nil {
+		return cty.NilVal, fmt.Errorf("failed to list stack files in %s: %w", opts.WorkingDir, err)
 	}
 
 	if len(foundFiles) == 0 {
@@ -62,24 +106,44 @@ func StackOutput(ctx context.Context, l log.Logger, opts *options.TerragruntOpti
 		return cty.NilVal, nil
 	}
 
-	outputs := make(map[string]map[string]cty.Value)
+	outputs := xsync.NewMap[string, map[string]cty.Value]()
 	declaredStacks := make(map[string]string)
 	declaredUnits := make(map[string]*config.Unit)
-
-	// save parsed stacks
 	parsedStackFiles := make(map[string]*config.StackConfig, len(foundFiles))
+
+	maxWorkers := max(1, min(opts.Parallelism, runtime.GOMAXPROCS(0)))
+
+	// reuse the project worker pool so error aggregation matches other concurrent commands
+	wp := worker.NewWorkerPool(maxWorkers)
+	defer wp.Stop()
+
+	waitWorkerErrors := func(mainErr error) error {
+		workerErr := wp.Wait()
+		if workerErr == nil {
+			return mainErr
+		}
+
+		if mainErr == nil {
+			return workerErr
+		}
+
+		return errors.Join(mainErr, workerErr)
+	}
 
 	for _, path := range foundFiles {
 		dir := filepath.Dir(path)
 
-		values, valuesErr := config.ReadValues(ctx, l, opts, dir)
+		ctx, pctx := configbridge.NewParsingContext(ctx, l, opts)
+		pctx = pctx.WithVenv(v)
+
+		values, valuesErr := config.ReadValues(ctx, pctx, l, dir)
 		if valuesErr != nil {
-			return cty.NilVal, errors.Errorf("Failed to read values from %s: %w", dir, valuesErr)
+			return cty.NilVal, waitWorkerErrors(fmt.Errorf("failed to read values from %s: %w", dir, valuesErr))
 		}
 
-		stackFile, stackErr := config.ReadStackConfigFile(ctx, l, opts, path, values)
+		stackFile, stackErr := config.ReadStackConfigFile(ctx, l, pctx, path, values)
 		if stackErr != nil {
-			return cty.NilVal, errors.Errorf("Failed to read stack file %s: %w", path, stackErr)
+			return cty.NilVal, waitWorkerErrors(fmt.Errorf("failed to read stack file %s: %w", path, stackErr))
 		}
 
 		parsedStackFiles[path] = stackFile
@@ -92,38 +156,40 @@ func StackOutput(ctx context.Context, l log.Logger, opts *options.TerragruntOpti
 		}
 
 		for _, unit := range stackFile.Units {
-			unitDir := config.GetUnitDir(dir, unit)
+			unitDir := unit.GeneratedPath(dir)
 
-			var output map[string]cty.Value
-
-			telemetryErr := telemetry.TelemeterFromContext(ctx).Collect(ctx, "unit_output", map[string]any{
-				"unit_name":   unit.Name,
-				"unit_source": unit.Source,
-				"unit_path":   unit.Path,
-			}, func(ctx context.Context) error {
-				var outputErr error
-
-				output, outputErr = unit.ReadOutputs(ctx, l, opts, unitDir)
-
-				return outputErr
-			})
-			if telemetryErr != nil {
-				return cty.NilVal, errors.New(telemetryErr)
+			// Excluded units are fully omitted from the final output, matching stack run behavior.
+			if _, excluded := excludedPaths[filepath.Clean(unitDir)]; excluded {
+				l.Debugf("Skipping output for excluded unit %s in %s", unit.Name, unitDir)
+				continue
 			}
 
 			key := filepath.Join(targetDir, unit.Path)
 			declaredUnits[key] = unit
-			outputs[key] = output
 
-			l.Debugf("Added output for %s", key)
+			wp.Submit(func() error {
+				out, err := readUnitOutput(ctx, l, pctx, unit, unitDir)
+				if err != nil {
+					return err
+				}
+
+				outputs.Store(key, out)
+
+				return nil
+			})
 		}
+	}
+
+	if err := waitWorkerErrors(nil); err != nil {
+		return cty.NilVal, err
 	}
 
 	unitOutputs := make(map[string]map[string]cty.Value)
 
-	// Build stack list separated by stacks, find all nested stacks, and build a dotted path. If no stack is found, use the unit name.
+	// Build stack list separated by stacks, find all nested stacks, and build
+	// a dotted path. If no stack is found, use the unit name.
 	for path, unit := range declaredUnits {
-		output, found := outputs[path]
+		output, found := outputs.Load(path)
 		if !found {
 			l.Debugf("No output found for %s", path)
 			continue
@@ -140,22 +206,15 @@ func StackOutput(ctx context.Context, l log.Logger, opts *options.TerragruntOpti
 			}
 		}
 
-		// Sort stackNames based on the length of stackPath to ensure correct order
-		stackNamesSorted := make([]string, len(stackNames))
-		copy(stackNamesSorted, stackNames)
-
-		for i := range stackNamesSorted {
-			for j := i + 1; j < len(stackNamesSorted); j++ {
-				// Compare lengths of the actual paths from the nameToPath map, not the declaredStacks lookup
-				if len(nameToPath[stackNamesSorted[i]]) < len(nameToPath[stackNamesSorted[j]]) {
-					stackNamesSorted[i], stackNamesSorted[j] = stackNamesSorted[j], stackNamesSorted[i]
-				}
-			}
-		}
+		// Sort by stack path length so the outermost stack (shortest path) comes
+		// first; this preserves the parent.child nesting order in the joined key.
+		slices.SortFunc(stackNames, func(a, b string) int {
+			return len(nameToPath[a]) - len(nameToPath[b])
+		})
 
 		stackKey := unit.Name
-		if len(stackNamesSorted) > 0 {
-			stackKey = strings.Join(stackNamesSorted, ".") + "." + unit.Name
+		if len(stackNames) > 0 {
+			stackKey = strings.Join(stackNames, ".") + "." + unit.Name
 		}
 
 		unitOutputs[stackKey] = output
@@ -168,12 +227,12 @@ func StackOutput(ctx context.Context, l log.Logger, opts *options.TerragruntOpti
 
 	nestedOutputs, err := nestUnitOutputs(unitOutputs)
 	if err != nil {
-		return cty.NilVal, errors.Errorf("Failed to nest unit outputs: %w", err)
+		return cty.NilVal, fmt.Errorf("failed to nest unit outputs: %w", err)
 	}
 
 	ctyResult, err := config.GoTypeToCty(nestedOutputs)
 	if err != nil {
-		return cty.NilVal, errors.Errorf("Failed to convert unit output to cty value: %s %w", result, err)
+		return cty.NilVal, fmt.Errorf("failed to convert unit output to cty value: %s %w", result, err)
 	}
 
 	return ctyResult, nil
@@ -216,7 +275,7 @@ func nestUnitOutputs(flat map[string]map[string]cty.Value) (map[string]any, erro
 			if i == len(parts)-1 {
 				ctyValue, err := config.ConvertValuesMapToCtyVal(value)
 				if err != nil {
-					return nil, errors.Errorf("Failed to convert unit output to cty value: %s %w", flatKey, err)
+					return nil, fmt.Errorf("failed to convert unit output to cty value: %s %w", flatKey, err)
 				}
 
 				current[part] = ctyValue
@@ -230,11 +289,58 @@ func nestUnitOutputs(flat map[string]map[string]cty.Value) (map[string]any, erro
 				current, ok = current[part].(map[string]any)
 
 				if !ok {
-					return nil, errors.Errorf("Failed to traverse unit output: %v %s", flat, part)
+					return nil, fmt.Errorf("failed to traverse unit output: %v %s", flat, part)
 				}
 			}
 		}
 	}
 
 	return nested, nil
+}
+
+// readUnitOutput returns the tofu/terraform outputs for a unit.
+func readUnitOutput(
+	ctx context.Context,
+	l log.Logger,
+	pctx *config.ParsingContext,
+	unit *config.Unit,
+	unitDir string,
+) (map[string]cty.Value, error) {
+	var output map[string]cty.Value
+
+	err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "unit_output", map[string]any{
+		"unit_name":   unit.Name,
+		"unit_source": unit.Source,
+		"unit_path":   unit.Path,
+	}, func(ctx context.Context) error {
+		var outputErr error
+
+		output, outputErr = unit.ReadOutputs(ctx, l, pctx, unitDir)
+
+		return outputErr
+	})
+	if err != nil {
+		return nil, UnitOutputError{UnitName: unit.Name, UnitDir: unitDir, Err: err}
+	}
+
+	return output, nil
+}
+
+// buildWorktreesIfNeeded creates worktrees if the filter-flag experiment is enabled and git filters exist.
+// Returns nil worktrees if the experiment is not enabled or no git filters are present.
+func buildWorktreesIfNeeded(
+	ctx context.Context,
+	l log.Logger,
+	opts *options.TerragruntOptions,
+) (*worktrees.Worktrees, error) {
+	gitFilters := opts.Filters.UniqueGitFilters()
+	if len(gitFilters) == 0 {
+		return nil, nil
+	}
+
+	return worktrees.NewWorktrees(ctx, l, worktrees.WorktreeOpts{
+		WorkingDir:     opts.WorkingDir,
+		GitExpressions: gitFilters,
+		Experiments:    opts.Experiments,
+	})
 }

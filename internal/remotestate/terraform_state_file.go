@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
-	"github.com/gruntwork-io/terragrunt/internal/errors"
 	"github.com/gruntwork-io/terragrunt/internal/remotestate/backend"
-	"github.com/gruntwork-io/terragrunt/util"
+	"github.com/gruntwork-io/terragrunt/internal/util"
 )
 
 // TODO: this file could be changed to use the Terraform Go code to read state files, but that code is relatively
@@ -56,12 +56,12 @@ func ParseTerraformStateFileFromLocation(backend string, config backend.Config, 
 		return ParseTerraformStateFile(stateFile)
 	}
 
-	if util.FileExists(util.JoinPath(dataDir, DefaultPathToRemoteStateFile)) {
-		return ParseTerraformStateFile(util.JoinPath(dataDir, DefaultPathToRemoteStateFile))
+	if util.FileExists(filepath.Join(dataDir, DefaultPathToRemoteStateFile)) {
+		return ParseTerraformStateFile(filepath.Join(dataDir, DefaultPathToRemoteStateFile))
 	}
 
-	if util.FileExists(util.JoinPath(workingDir, DefaultPathToLocalStateFile)) {
-		return ParseTerraformStateFile(util.JoinPath(workingDir, DefaultPathToLocalStateFile))
+	if util.FileExists(filepath.Join(workingDir, DefaultPathToLocalStateFile)) {
+		return ParseTerraformStateFile(filepath.Join(workingDir, DefaultPathToLocalStateFile))
 	}
 
 	return nil, nil
@@ -71,12 +71,12 @@ func ParseTerraformStateFileFromLocation(backend string, config backend.Config, 
 func ParseTerraformStateFile(path string) (*TerraformState, error) {
 	bytes, err := os.ReadFile(path)
 	if err != nil {
-		return nil, errors.New(CantParseTerraformStateFileError{Path: path, UnderlyingErr: err})
+		return nil, CantParseTerraformStateFileError{Path: path, UnderlyingErr: err}
 	}
 
 	state, err := ParseTerraformState(bytes)
 	if err != nil {
-		return nil, errors.New(CantParseTerraformStateFileError{Path: path, UnderlyingErr: err})
+		return nil, CantParseTerraformStateFileError{Path: path, UnderlyingErr: err}
 	}
 
 	return state, nil
@@ -91,7 +91,7 @@ func ParseTerraformState(terraformStateData []byte) (*TerraformState, error) {
 	}
 
 	if err := json.Unmarshal(terraformStateData, terraformState); err != nil {
-		return nil, errors.New(err)
+		return nil, err
 	}
 
 	return terraformState, nil

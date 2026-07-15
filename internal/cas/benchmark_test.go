@@ -10,14 +10,19 @@ import (
 	"time"
 
 	"github.com/gruntwork-io/terragrunt/internal/cas"
+	"github.com/gruntwork-io/terragrunt/internal/git"
+	"github.com/gruntwork-io/terragrunt/internal/vexec"
 	"github.com/gruntwork-io/terragrunt/test/helpers/logger"
+	"github.com/stretchr/testify/require"
 )
 
 func BenchmarkClone(b *testing.B) {
-	// Use a small, public repository for consistent results
-	repo := "https://github.com/gruntwork-io/terragrunt.git"
+	repoURL := startBenchServer(b)
 
 	l := logger.CreateLogger()
+
+	v, err := cas.OSVenv()
+	require.NoError(b, err)
 
 	b.Run("fresh clone", func(b *testing.B) {
 		tempDir := b.TempDir()
@@ -30,20 +35,13 @@ func BenchmarkClone(b *testing.B) {
 			storePath := filepath.Join(tempDir, "store", strconv.Itoa(i))
 			targetPath := filepath.Join(tempDir, "repo", strconv.Itoa(i))
 
-			c, err := cas.New(cas.Options{
-				StorePath: storePath,
-			})
-			if err != nil {
-				b.Fatal(err)
-			}
+			c, err := cas.New(cas.WithStorePath(storePath))
+			require.NoError(b, err)
 
 			b.StartTimer()
 
-			if err := c.Clone(b.Context(), l, &cas.CloneOptions{
-				Dir: targetPath,
-			}, repo); err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, c.Clone(b.Context(), l, v, repoURL, cas.WithDir(targetPath),
+				cas.WithDepth(-1)))
 		}
 	})
 
@@ -52,18 +50,11 @@ func BenchmarkClone(b *testing.B) {
 		storePath := filepath.Join(tempDir, "store")
 
 		// First clone to populate store
-		c, err := cas.New(cas.Options{
-			StorePath: storePath,
-		})
-		if err != nil {
-			b.Fatal(err)
-		}
+		c, err := cas.New(cas.WithStorePath(storePath))
+		require.NoError(b, err)
 
-		if err := c.Clone(b.Context(), l, &cas.CloneOptions{
-			Dir: filepath.Join(tempDir, "initial"),
-		}, repo); err != nil {
-			b.Fatal(err)
-		}
+		require.NoError(b, c.Clone(b.Context(), l, v, repoURL, cas.WithDir(filepath.Join(tempDir, "initial")),
+			cas.WithDepth(-1)))
 
 		b.ResetTimer()
 
@@ -72,20 +63,13 @@ func BenchmarkClone(b *testing.B) {
 
 			targetPath := filepath.Join(tempDir, "repo", strconv.Itoa(i))
 
-			c, err := cas.New(cas.Options{
-				StorePath: storePath,
-			})
-			if err != nil {
-				b.Fatal(err)
-			}
+			c, err := cas.New(cas.WithStorePath(storePath))
+			require.NoError(b, err)
 
 			b.StartTimer()
 
-			if err := c.Clone(b.Context(), l, &cas.CloneOptions{
-				Dir: targetPath,
-			}, repo); err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, c.Clone(b.Context(), l, v, repoURL, cas.WithDir(targetPath),
+				cas.WithDepth(-1)))
 		}
 	})
 }
@@ -100,6 +84,9 @@ func BenchmarkContent(b *testing.B) {
 
 	l := logger.CreateLogger()
 
+	v, err := cas.OSVenv()
+	require.NoError(b, err)
+
 	b.Run("store", func(b *testing.B) {
 		for i := 0; b.Loop(); i++ {
 			b.StopTimer()
@@ -108,9 +95,7 @@ func BenchmarkContent(b *testing.B) {
 
 			b.StartTimer()
 
-			if err := content.Store(l, hash, testData); err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, content.Store(l, v, hash, testData))
 		}
 	})
 
@@ -136,7 +121,7 @@ func BenchmarkContent(b *testing.B) {
 
 				mu.Unlock()
 
-				if err := content.Store(l, hash, testData); err != nil {
+				if err := content.Store(l, v, hash, testData); err != nil {
 					b.Fatal(err)
 				}
 
@@ -147,70 +132,52 @@ func BenchmarkContent(b *testing.B) {
 }
 
 func BenchmarkGitOperations(b *testing.B) {
-	// Setup a git repository for testing
+	repoURL := startBenchServer(b)
+
+	// Clone the repo locally for tree operations
 	repoDir := b.TempDir()
 
-	git, err := cas.NewGitRunner()
-	if err != nil {
-		b.Fatal(err)
-	}
+	g, err := git.NewGitRunner(vexec.NewOSExec())
+	require.NoError(b, err)
 
-	git = git.WithWorkDir(repoDir)
+	g = g.WithWorkDir(repoDir)
 
 	ctx := b.Context()
 
-	if err = git.Clone(ctx, "https://github.com/gruntwork-io/terragrunt.git", false, 1, "main"); err != nil {
-		b.Fatal(err)
-	}
+	require.NoError(b, g.Clone(ctx, repoURL, false, 0, ""))
 
 	b.Run("ls-remote", func(b *testing.B) {
-		git, err = cas.NewGitRunner()
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		git = git.WithWorkDir(repoDir)
+		runner, err := git.NewGitRunner(vexec.NewOSExec())
+		require.NoError(b, err)
 
 		b.ResetTimer()
 
 		for b.Loop() {
-			_, err := git.LsRemote(ctx, "https://github.com/gruntwork-io/terragrunt.git", "HEAD")
-			if err != nil {
-				b.Fatal(err)
-			}
+			_, err := runner.LsRemote(ctx, repoURL, "HEAD")
+			require.NoError(b, err)
 		}
 	})
 
-	b.Run("ls-tree", func(b *testing.B) {
+	b.Run("ls-tree -r", func(b *testing.B) {
 		b.ResetTimer()
 
 		for b.Loop() {
-			_, err := git.LsTree(ctx, "HEAD", ".")
-			if err != nil {
-				b.Fatal(err)
-			}
+			_, err := g.LsTreeRecursive(ctx, "HEAD")
+			require.NoError(b, err)
 		}
 	})
 
 	b.Run("cat-file", func(b *testing.B) {
-		// First get a valid hash
-		tree, err := git.LsTree(ctx, "HEAD", ".")
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		if len(tree.Entries()) == 0 {
-			b.Fatal("no entries in tree")
-		}
+		tree, err := g.LsTreeRecursive(ctx, "HEAD")
+		require.NoError(b, err)
+		require.NotEmpty(b, tree.Entries(), "no entries in tree")
 
 		hash := tree.Entries()[0].Hash
 
 		tmpFile := b.TempDir() + "/cat-file"
 
 		tmp, err := os.Create(tmpFile)
-		if err != nil {
-			b.Fatal(err)
-		}
+		require.NoError(b, err)
 
 		defer os.Remove(tmpFile)
 		defer tmp.Close()
@@ -218,10 +185,26 @@ func BenchmarkGitOperations(b *testing.B) {
 		b.ResetTimer()
 
 		for b.Loop() {
-			err := git.CatFile(ctx, hash, tmp)
-			if err != nil {
-				b.Fatal(err)
-			}
+			err := g.CatFile(ctx, hash, tmp)
+			require.NoError(b, err)
 		}
 	})
+}
+
+func startBenchServer(b *testing.B) string {
+	b.Helper()
+
+	srv, err := git.NewServer()
+	require.NoError(b, err)
+
+	b.Cleanup(func() { _ = srv.Close() })
+
+	require.NoError(b, srv.CommitFile(b.Context(), "README.md", []byte("# test repo"), "add readme"))
+	require.NoError(b, srv.CommitFile(b.Context(), "main.tf", []byte(`resource "null_resource" "test" {}`), "add main.tf"))
+	require.NoError(b, srv.CommitFile(b.Context(), "test/integration_test.go", []byte("package test"), "add test file"))
+
+	url, err := srv.Start(b.Context())
+	require.NoError(b, err)
+
+	return url
 }

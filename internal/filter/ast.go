@@ -1,10 +1,12 @@
 package filter
 
 import (
+	"path"
 	"path/filepath"
-	"sync"
+	"strconv"
 
-	"github.com/gobwas/glob"
+	"github.com/gruntwork-io/terragrunt/internal/component"
+	"github.com/gruntwork-io/terragrunt/internal/glob"
 )
 
 // Expression is the interface that all AST nodes must implement.
@@ -21,95 +23,95 @@ type Expression interface {
 	RequiresParse() (Expression, bool)
 	// IsRestrictedToStacks returns true if the expression is restricted to stacks.
 	IsRestrictedToStacks() bool
+	// Negated returns the equivalent expression with negation flipped.
+	Negated() Expression
 }
 
-// PathFilter represents a path or glob filter (e.g., "./path/**/*" or "/absolute/path").
-type PathFilter struct {
-	compiledGlob glob.Glob
-	compileErr   error
+// Expressions is a slice of expressions.
+type Expressions []Expression
+
+// PathExpression represents a path or glob filter (e.g., "./path/**/*" or "/absolute/path").
+type PathExpression struct {
+	compiledGlob glob.Matcher
 	Value        string
-	WorkingDir   string
-	compileOnce  sync.Once
 }
 
-// NewPathFilter creates a new PathFilter with lazy glob compilation.
-func NewPathFilter(value string, workingDir string) *PathFilter {
-	return &PathFilter{Value: value, WorkingDir: workingDir}
-}
+// NewPathFilter creates a new PathFilter with eager glob compilation.
+func NewPathFilter(value string) (*PathExpression, error) {
+	// Glob patterns are matched against '/'-separated paths on every platform.
+	pattern := path.Clean(filepath.ToSlash(value))
 
-// CompileGlob returns the compiled glob pattern, compiling it on first call.
-// Subsequent calls return the cached compiled glob and any error.
-// Uses sync.Once for thread-safe lazy initialization.
-func (p *PathFilter) CompileGlob() (glob.Glob, error) {
-	p.compileOnce.Do(func() {
-		pattern := p.Value
-		if !filepath.IsAbs(pattern) {
-			pattern = filepath.Join(p.WorkingDir, pattern)
-		}
-
-		pattern = filepath.ToSlash(pattern)
-		p.compiledGlob, p.compileErr = glob.Compile(pattern, '/')
-	})
-
-	return p.compiledGlob, p.compileErr
-}
-
-func (p *PathFilter) expressionNode()                       {}
-func (p *PathFilter) String() string                        { return p.Value }
-func (p *PathFilter) RequiresDiscovery() (Expression, bool) { return p, false }
-func (p *PathFilter) RequiresParse() (Expression, bool)     { return p, false }
-func (p *PathFilter) IsRestrictedToStacks() bool            { return false }
-
-// AttributeFilter represents a key-value attribute filter (e.g., "name=my-app").
-type AttributeFilter struct {
-	compiledGlob glob.Glob
-	compileErr   error
-	Key          string
-	Value        string
-	WorkingDir   string
-	compileOnce  sync.Once
-}
-
-// NewAttributeFilter creates a new AttributeFilter with lazy glob compilation.
-func NewAttributeFilter(key string, value string, workingDir string) *AttributeFilter {
-	return &AttributeFilter{Key: key, Value: value, WorkingDir: workingDir}
-}
-
-// CompileGlob returns the compiled glob pattern for name and reading filters, compiling it on first call.
-// Returns an error if called on unsupported attributes (e.g. type, external).
-// Uses sync.Once for thread-safe lazy initialization.
-func (a *AttributeFilter) CompileGlob() (glob.Glob, error) {
-	// Only compile for attributes that support glob matching
-	if !a.supportsGlob() {
-		return nil, NewEvaluationError("attribute '" + a.Key + "' does not support glob patterns")
+	compiled, err := glob.Compile(pattern)
+	if err != nil {
+		return nil, err
 	}
 
-	a.compileOnce.Do(func() {
-		pattern := a.Value
+	return &PathExpression{Value: value, compiledGlob: compiled}, nil
+}
 
-		if a.Key == AttributeReading {
-			if !filepath.IsAbs(pattern) {
-				pattern = filepath.Join(a.WorkingDir, pattern)
-			}
+// Glob returns the pre-compiled glob pattern.
+func (p *PathExpression) Glob() glob.Matcher {
+	return p.compiledGlob
+}
 
-			pattern = filepath.ToSlash(pattern)
+func (p *PathExpression) expressionNode()                       {}
+func (p *PathExpression) String() string                        { return p.Value }
+func (p *PathExpression) RequiresDiscovery() (Expression, bool) { return p, false }
+func (p *PathExpression) RequiresParse() (Expression, bool)     { return p, false }
+func (p *PathExpression) IsRestrictedToStacks() bool            { return false }
+func (p *PathExpression) Negated() Expression                   { return NewPrefixExpression("!", p) }
+
+// AttributeExpression represents a key-value attribute filter (e.g., "name=my-app").
+type AttributeExpression struct {
+	compiledGlob glob.Matcher
+	Key          string
+	Value        string
+}
+
+// NewAttributeExpression creates a new AttributeExpression with eager glob compilation
+// for attributes that support glob matching (name, reading, source).
+func NewAttributeExpression(key string, value string) (*AttributeExpression, error) {
+	expr := &AttributeExpression{Key: key, Value: value}
+
+	if expr.supportsGlob() {
+		pattern := value
+
+		if key == AttributeReading {
+			// Clean in forward-slash space, as in NewPathFilter.
+			pattern = path.Clean(filepath.ToSlash(pattern))
 		}
 
-		a.compiledGlob, a.compileErr = glob.Compile(pattern, '/')
-	})
+		compiled, err := glob.Compile(pattern)
+		if err != nil {
+			return nil, err
+		}
 
-	return a.compiledGlob, a.compileErr
+		expr.compiledGlob = compiled
+	}
+
+	return expr, nil
+}
+
+// NewTypeExpression creates a new AttributeExpression for the "type" attribute.
+// Type filters do not support glob matching, so this constructor cannot fail.
+func NewTypeExpression(kind component.Kind) *AttributeExpression {
+	return &AttributeExpression{Key: AttributeType, Value: string(kind)}
+}
+
+// Glob returns the pre-compiled glob pattern.
+func (a *AttributeExpression) Glob() glob.Matcher {
+	return a.compiledGlob
 }
 
 // supportsGlob returns true if the attribute filter supports glob patterns.
-func (a *AttributeFilter) supportsGlob() bool {
+func (a *AttributeExpression) supportsGlob() bool {
 	return a.Key == AttributeReading || a.Key == AttributeName || a.Key == AttributeSource
 }
 
-func (a *AttributeFilter) expressionNode()                       {}
-func (a *AttributeFilter) String() string                        { return a.Key + "=" + a.Value }
-func (a *AttributeFilter) RequiresDiscovery() (Expression, bool) { return a, true }
-func (a *AttributeFilter) RequiresParse() (Expression, bool) {
+func (a *AttributeExpression) expressionNode()                       {}
+func (a *AttributeExpression) String() string                        { return a.Key + "=" + a.Value }
+func (a *AttributeExpression) RequiresDiscovery() (Expression, bool) { return a, true }
+func (a *AttributeExpression) RequiresParse() (Expression, bool) {
 	switch a.Key {
 	// All of these attributes can be determined based on the component + configuration filepath.
 	case AttributeName, AttributeType, AttributeExternal:
@@ -123,8 +125,11 @@ func (a *AttributeFilter) RequiresParse() (Expression, bool) {
 		return nil, true
 	}
 }
-func (a *AttributeFilter) IsRestrictedToStacks() bool {
+func (a *AttributeExpression) IsRestrictedToStacks() bool {
 	return a.Key == "type" && a.Value == "stack"
+}
+func (a *AttributeExpression) Negated() Expression {
+	return NewPrefixExpression("!", a)
 }
 
 // PrefixExpression represents a prefix operator expression (e.g., "!name=foo").
@@ -150,7 +155,7 @@ func (p *PrefixExpression) IsRestrictedToStacks() bool {
 	switch p.Operator {
 	case "!":
 		switch a := p.Right.(type) {
-		case *AttributeFilter:
+		case *AttributeExpression:
 			switch a.Key {
 			case "type":
 				return a.Value != "stack"
@@ -162,6 +167,14 @@ func (p *PrefixExpression) IsRestrictedToStacks() bool {
 		}
 	default:
 		return false
+	}
+}
+func (p *PrefixExpression) Negated() Expression {
+	switch p.Operator {
+	case "!":
+		return p.Right
+	default:
+		return NewPrefixExpression("!", p.Right)
 	}
 }
 
@@ -211,34 +224,62 @@ func (i *InfixExpression) IsRestrictedToStacks() bool {
 		return false
 	}
 }
+func (i *InfixExpression) Negated() Expression {
+	switch i.Operator {
+	case "|":
+		return NewInfixExpression(i.Left.Negated(), i.Operator, i.Right)
+	default:
+		return NewInfixExpression(i.Left.Negated(), i.Operator, i.Right)
+	}
+}
 
-// GraphExpression represents a graph traversal expression (e.g., "...foo", "foo...", "...foo...", "^foo").
+// GraphExpression represents a graph traversal expression (e.g., "...foo", "foo...", "..1foo", "foo..2").
+// Depth fields control how many levels of dependencies/dependents to traverse.
 type GraphExpression struct {
 	Target              Expression
 	IncludeDependents   bool
 	IncludeDependencies bool
 	ExcludeTarget       bool
+	DependentDepth      int
+	DependencyDepth     int
 }
 
-// NewGraphExpression creates a new GraphExpression.
-func NewGraphExpression(
-	target Expression,
-	includeDependents bool,
-	includeDependencies bool,
-	excludeTarget bool,
-) *GraphExpression {
+// NewGraphExpression creates a new GraphExpression for the given target.
+// Use the builder methods WithDependents, WithDependencies, and WithExcludeTarget
+// to configure graph traversal behavior.
+func NewGraphExpression(target Expression) *GraphExpression {
 	return &GraphExpression{
-		Target:              target,
-		IncludeDependents:   includeDependents,
-		IncludeDependencies: includeDependencies,
-		ExcludeTarget:       excludeTarget,
+		Target: target,
 	}
+}
+
+// WithDependents includes dependents (reverse dependencies) in the graph traversal.
+func (g *GraphExpression) WithDependents() *GraphExpression {
+	g.IncludeDependents = true
+	return g
+}
+
+// WithDependencies includes dependencies in the graph traversal.
+func (g *GraphExpression) WithDependencies() *GraphExpression {
+	g.IncludeDependencies = true
+	return g
+}
+
+// WithExcludeTarget excludes the target itself from the graph traversal results.
+func (g *GraphExpression) WithExcludeTarget() *GraphExpression {
+	g.ExcludeTarget = true
+	return g
 }
 
 func (g *GraphExpression) expressionNode() {}
 func (g *GraphExpression) String() string {
 	result := ""
+
 	if g.IncludeDependents {
+		if g.DependentDepth > 0 {
+			result += strconv.Itoa(g.DependentDepth)
+		}
+
 		result += "..."
 	}
 
@@ -247,8 +288,13 @@ func (g *GraphExpression) String() string {
 	}
 
 	result += g.Target.String()
+
 	if g.IncludeDependencies {
 		result += "..."
+
+		if g.DependencyDepth > 0 {
+			result += strconv.Itoa(g.DependencyDepth)
+		}
 	}
 
 	return result
@@ -262,3 +308,56 @@ func (g *GraphExpression) RequiresParse() (Expression, bool) {
 	return g, true
 }
 func (g *GraphExpression) IsRestrictedToStacks() bool { return false }
+func (g *GraphExpression) Negated() Expression {
+	return NewPrefixExpression("!", g)
+}
+
+// GitExpression represents a Git-based filter expression (e.g., "[main...HEAD]" or "[main]").
+// It filters components based on changes between Git references.
+type GitExpression struct {
+	FromRef string
+	ToRef   string
+}
+
+func NewGitExpression(fromRef, toRef string) *GitExpression {
+	return &GitExpression{FromRef: fromRef, ToRef: toRef}
+}
+
+func (g *GitExpression) expressionNode() {}
+func (g *GitExpression) String() string {
+	return "[" + g.FromRef + "..." + g.ToRef + "]"
+}
+func (g *GitExpression) RequiresDiscovery() (Expression, bool) {
+	// Git filters require discovery to check which components changed between references
+	return g, true
+}
+func (g *GitExpression) RequiresParse() (Expression, bool) {
+	// Git filters don't require parsing - they compare file paths, not HCL content
+	return nil, false
+}
+func (g *GitExpression) IsRestrictedToStacks() bool { return false }
+func (g *GitExpression) Negated() Expression {
+	return NewPrefixExpression("!", g)
+}
+
+// GitExpressions is a slice of Git expressions.
+type GitExpressions []*GitExpression
+
+// UniqueGitRefs returns all unique Git references in a slice of expressions.
+func (e GitExpressions) UniqueGitRefs() []string {
+	refSet := make(map[string]struct{}, len(e))
+
+	for _, expr := range e {
+		refs := collectGitReferences(expr)
+		for _, ref := range refs {
+			refSet[ref] = struct{}{}
+		}
+	}
+
+	result := make([]string, 0, len(refSet))
+	for ref := range refSet {
+		result = append(result, ref)
+	}
+
+	return result
+}

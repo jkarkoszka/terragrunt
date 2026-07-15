@@ -1,13 +1,14 @@
 package test_test
 
 import (
-	"bytes"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gruntwork-io/terragrunt/test/helpers"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // This tests terragrunt properly passes through terraform commands with sub commands
@@ -21,36 +22,43 @@ func TestDeprecatedDefaultCommand_TerraformSubcommandCliArgs(t *testing.T) {
 	}{
 		{
 			command:  []string{"force-unlock"},
-			expected: wrappedBinary() + " force-unlock",
+			expected: wrappedBinary(t.Context()) + " force-unlock",
 		},
 		{
 			command:  []string{"force-unlock", "foo"},
-			expected: wrappedBinary() + " force-unlock foo",
+			expected: wrappedBinary(t.Context()) + " force-unlock foo",
 		},
 		{
 			command:  []string{"force-unlock", "foo", "bar", "baz"},
-			expected: wrappedBinary() + " force-unlock foo bar baz",
+			expected: wrappedBinary(t.Context()) + " force-unlock foo bar baz",
 		},
 		{
 			command:  []string{"force-unlock", "foo", "bar", "baz", "foobar"},
-			expected: wrappedBinary() + " force-unlock foo bar baz foobar",
+			expected: wrappedBinary(t.Context()) + " force-unlock foo bar baz foobar",
 		},
 	}
 
 	for _, tc := range testCases {
-		cmd := fmt.Sprintf("terragrunt %s --non-interactive --log-level trace --working-dir %s", strings.Join(tc.command, " "), testFixtureExtraArgsPath)
+		tofuCmd := strings.Join(tc.command, " ")
 
-		var (
-			stdout bytes.Buffer
-			stderr bytes.Buffer
-		)
-		// Call helpers.RunTerragruntCommand directly because this command contains failures (which causes helpers.RunTerragruntRedirectOutput to abort) but we don't care.
-		if err := helpers.RunTerragruntCommand(t, cmd, &stdout, &stderr); err == nil {
-			t.Fatalf("Failed to properly fail command: %v.", cmd)
-		}
+		t.Run(tofuCmd, func(t *testing.T) {
+			t.Parallel()
 
-		output := stdout.String()
-		errOutput := stderr.String()
-		assert.True(t, strings.Contains(errOutput, tc.expected) || strings.Contains(output, tc.expected))
+			tmpEnvPath := helpers.CopyEnvironment(t, testFixtureExtraArgsPath)
+			rootPath := filepath.Join(tmpEnvPath, testFixtureExtraArgsPath)
+
+			cmd := fmt.Sprintf(
+				"terragrunt --log-level debug --non-interactive --working-dir %s -- %s",
+				rootPath,
+				strings.Join(tc.command, " "),
+			)
+
+			// Call helpers.RunTerragruntCommand directly because this command
+			// contains failures (which causes helpers.RunTerragruntRedirectOutput to abort) but we don't care.
+			stdout, stderr, err := helpers.RunTerragruntCommandWithOutput(t, cmd)
+			require.Error(t, err)
+
+			assert.True(t, strings.Contains(stderr, tc.expected) || strings.Contains(stdout, tc.expected))
+		})
 	}
 }

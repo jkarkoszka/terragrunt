@@ -4,6 +4,7 @@ package helpers
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -20,11 +21,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"testing"
 	"time"
 
 	"github.com/gruntwork-io/terragrunt/internal/awshelper"
@@ -33,22 +38,21 @@ import (
 	"github.com/gruntwork-io/terragrunt/test/helpers/logger"
 	"github.com/mattn/go-shellwords"
 
-	"os"
-	"path/filepath"
-	"testing"
+	"errors"
 
-	"github.com/NYTimes/gziphandler"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
-	"github.com/gruntwork-io/go-commons/version"
-	"github.com/gruntwork-io/terragrunt/cli"
-	"github.com/gruntwork-io/terragrunt/internal/errors"
+	"github.com/gruntwork-io/terragrunt/internal/cli"
 	"github.com/gruntwork-io/terragrunt/internal/runner/run"
-	"github.com/gruntwork-io/terragrunt/options"
-	"github.com/gruntwork-io/terragrunt/util"
+	"github.com/gruntwork-io/terragrunt/internal/util"
+	"github.com/gruntwork-io/terragrunt/internal/venv"
+	"github.com/gruntwork-io/terragrunt/internal/version"
+	"github.com/gruntwork-io/terragrunt/internal/vexec"
+	writerpkg "github.com/gruntwork-io/terragrunt/internal/writer"
+	"github.com/gruntwork-io/terragrunt/pkg/options"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -71,14 +75,37 @@ const (
 	// Repeated right now, but it might not be later.
 	TestFixtureOutDir = "fixtures/out-dir"
 
-	readPermissions      = 0444
-	readWritePermissions = 0666
-	allPermissions       = 0777
+	ReportFile = "report.json"
+
+	readPermissions      = 0o444
+	readWritePermissions = 0o666
+	allPermissions       = 0o777
 
 	caKeyBits = 4096
 
 	semverPartsLen = 3
+
+	// cleanupTimeout caps the runtime of a cleanup helper invoked
+	// through CleanupContext. Two minutes is generous enough for
+	// S3/GCS/DynamoDB teardown including object listing and per-object
+	// deletion, short enough to bound a hung helper.
+	cleanupTimeout = 2 * time.Minute
 )
+
+// CleanupContext returns a context detached from t.Context()'s
+// cancellation signal so cleanup helpers run correctly when invoked
+// from t.Cleanup callbacks. By the time t.Cleanup fires, t.Context()
+// is already canceled and any SDK call against it returns immediately
+// with "context canceled", silently leaving cloud resources behind.
+//
+// The returned context inherits values from t.Context() (so SDK
+// instrumentation propagates) but does not inherit cancellation; a
+// fresh cleanupTimeout bounds the helper. Callers must call the
+// cancel function when done.
+func CleanupContext(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	return context.WithTimeout(context.WithoutCancel(t.Context()), cleanupTimeout)
+}
 
 type TerraformOutput struct {
 	Type      any  `json:"Type"`
@@ -89,29 +116,55 @@ type TerraformOutput struct {
 func CopyEnvironment(t *testing.T, environmentPath string, includeInCopy ...string) string {
 	t.Helper()
 
-	tmpDir := t.TempDir()
+	tmpDir := TmpDirWOSymlinks(t)
 
 	t.Logf("Copying %s to %s", environmentPath, tmpDir)
 
+	// Exclude OpenTofu/Terraform/Terragrunt cache directories
+	// that may have been created when manually running in the fixtures directory.
+	excludeFromCopy := []string{
+		"**/.terraform/**",
+		"**/.terragrunt-cache/**",
+		"**/terragrunt-debug.tfvars.json",
+	}
+
 	require.NoError(
 		t,
-		util.CopyFolderContents(logger.CreateLogger(), environmentPath, util.JoinPath(tmpDir, environmentPath), ".terragrunt-test", includeInCopy, nil),
+		util.CopyFolderContents(
+			logger.CreateLogger(),
+			MustAbs(t, environmentPath),
+			filepath.Join(tmpDir, environmentPath),
+			".terragrunt-test",
+			util.WithIncludeInCopy(includeInCopy...),
+			util.WithExcludeFromCopy(excludeFromCopy...),
+			util.WithFastCopy(),
+		),
 	)
-
-	tmpDir, err := filepath.EvalSymlinks(tmpDir)
-	require.NoError(t, err)
 
 	return tmpDir
 }
 
-func CreateTmpTerragruntConfig(t *testing.T, templatesPath string, s3BucketName string, lockTableName string, configFileName string) string {
+func CreateTmpTerragruntConfig(
+	t *testing.T,
+	templatesPath string,
+	s3BucketName string,
+	lockTableName string,
+	configFileName string,
+) string {
 	t.Helper()
 
-	tmpFolder := t.TempDir()
+	tmpFolder := TmpDirWOSymlinks(t)
 
-	tmpTerragruntConfigFile := util.JoinPath(tmpFolder, configFileName)
-	originalTerragruntConfigPath := util.JoinPath(templatesPath, configFileName)
-	CopyTerragruntConfigAndFillPlaceholders(t, originalTerragruntConfigPath, tmpTerragruntConfigFile, s3BucketName, lockTableName, "not-used")
+	tmpTerragruntConfigFile := filepath.Join(tmpFolder, configFileName)
+	originalTerragruntConfigPath := filepath.Join(templatesPath, configFileName)
+	CopyTerragruntConfigAndFillPlaceholders(
+		t,
+		originalTerragruntConfigPath,
+		tmpTerragruntConfigFile,
+		s3BucketName,
+		lockTableName,
+		"not-used",
+	)
 
 	return tmpTerragruntConfigFile
 }
@@ -119,9 +172,9 @@ func CreateTmpTerragruntConfig(t *testing.T, templatesPath string, s3BucketName 
 func CreateTmpTerragruntConfigContent(t *testing.T, contents string, configFileName string) string {
 	t.Helper()
 
-	tmpFolder := t.TempDir()
+	tmpFolder := TmpDirWOSymlinks(t)
 
-	tmpTerragruntConfigFile := util.JoinPath(tmpFolder, configFileName)
+	tmpTerragruntConfigFile := filepath.Join(tmpFolder, configFileName)
 
 	if err := os.WriteFile(tmpTerragruntConfigFile, []byte(contents), readPermissions); err != nil {
 		t.Fatalf("Error writing temp Terragrunt config to %s: %v", tmpTerragruntConfigFile, err)
@@ -187,7 +240,10 @@ func CreateS3ClientForTest(t *testing.T, awsRegion string, opts ...options.Terra
 
 	awsConfig := &awshelper.AwsSessionConfig{Region: awsRegion}
 
-	cfg, err := awshelper.CreateAwsConfig(t.Context(), logger.CreateLogger(), awsConfig, mockOptions)
+	cfg, err := awshelper.NewAWSConfigBuilder().
+		WithSessionConfig(awsConfig).
+		WithIAMRoleOptions(mockOptions.IAMRoleOptions).
+		Build(t.Context(), logger.CreateLogger())
 	require.NoError(t, err, "Error creating S3 client")
 
 	return s3.NewFromConfig(cfg)
@@ -206,7 +262,10 @@ func CreateDynamoDBClientForTest(t *testing.T, awsRegion, awsProfile, iamRoleArn
 		RoleArn: iamRoleArn,
 	}
 
-	cfg, err := awshelper.CreateAwsConfig(t.Context(), logger.CreateLogger(), sessionConfig, mockOptions)
+	cfg, err := awshelper.NewAWSConfigBuilder().
+		WithSessionConfig(sessionConfig).
+		WithIAMRoleOptions(mockOptions.IAMRoleOptions).
+		Build(t.Context(), logger.CreateLogger())
 	require.NoError(t, err, "Error creating DynamoDB client")
 
 	return dynamodb.NewFromConfig(cfg)
@@ -218,10 +277,13 @@ func DeleteS3Bucket(t *testing.T, awsRegion string, bucketName string, opts ...o
 
 	client := CreateS3ClientForTest(t, awsRegion, opts...)
 
+	ctx, cancel := CleanupContext(t)
+	defer cancel()
+
 	t.Logf("Deleting test s3 bucket %s", bucketName)
 
 	// First check if bucket exists
-	_, err := client.HeadBucket(t.Context(), &s3.HeadBucketInput{Bucket: aws.String(bucketName)})
+	_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucketName)})
 	if err != nil {
 		if isAWSResourceNotFoundError(err) {
 			t.Logf("S3 bucket %s does not exist, cleanup already complete", bucketName)
@@ -231,9 +293,9 @@ func DeleteS3Bucket(t *testing.T, awsRegion string, bucketName string, opts ...o
 		t.Logf("Error checking if S3 bucket %s exists: %v", bucketName, err)
 	}
 
-	cleanS3Bucket(t, client, bucketName)
+	cleanS3Bucket(t, ctx, client, bucketName)
 
-	if _, err := client.DeleteBucket(t.Context(), &s3.DeleteBucketInput{Bucket: aws.String(bucketName)}); err != nil {
+	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucketName)}); err != nil {
 		if isAWSResourceNotFoundError(err) {
 			t.Logf("S3 bucket %s was already deleted", bucketName)
 			return nil
@@ -246,15 +308,15 @@ func DeleteS3Bucket(t *testing.T, awsRegion string, bucketName string, opts ...o
 		// Sleep for a little bit first to give the bucket a chance to be ready.
 		time.Sleep(1 * time.Second)
 
-		cleanS3Bucket(t, client, bucketName)
+		cleanS3Bucket(t, ctx, client, bucketName)
 
-		if _, err = client.DeleteBucket(t.Context(), &s3.DeleteBucketInput{Bucket: aws.String(bucketName)}); err != nil {
+		if _, err = client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucketName)}); err != nil {
 			if isAWSResourceNotFoundError(err) {
 				t.Logf("S3 bucket %s was already deleted", bucketName)
 				return nil
 			}
 
-			t.Logf("Failed to delete S3 bucket %s: %v", bucketName, err)
+			t.Errorf("Failed to delete S3 bucket %s: %v", bucketName, err)
 
 			return err
 		}
@@ -265,7 +327,7 @@ func DeleteS3Bucket(t *testing.T, awsRegion string, bucketName string, opts ...o
 	return nil
 }
 
-func cleanS3Bucket(t *testing.T, client *s3.Client, bucketName string) {
+func cleanS3Bucket(t *testing.T, ctx context.Context, client *s3.Client, bucketName string) {
 	t.Helper()
 
 	versionsInput := &s3.ListObjectVersionsInput{
@@ -273,7 +335,7 @@ func cleanS3Bucket(t *testing.T, client *s3.Client, bucketName string) {
 	}
 
 	for {
-		out, err := client.ListObjectVersions(t.Context(), versionsInput)
+		out, err := client.ListObjectVersions(ctx, versionsInput)
 		if err != nil {
 			if isAWSResourceNotFoundError(err) {
 				t.Logf("S3 bucket %s does not exist, skipping cleanup", bucketName)
@@ -290,7 +352,8 @@ func cleanS3Bucket(t *testing.T, client *s3.Client, bucketName string) {
 		if len(out.Versions) > 0 {
 			var objectsToDelete []s3types.ObjectIdentifier
 
-			for _, version := range out.Versions {
+			for i := range out.Versions {
+				version := &out.Versions[i]
 				objectsToDelete = append(objectsToDelete, s3types.ObjectIdentifier{
 					Key:       version.Key,
 					VersionId: version.VersionId,
@@ -304,7 +367,7 @@ func cleanS3Bucket(t *testing.T, client *s3.Client, bucketName string) {
 				},
 			}
 
-			_, err := client.DeleteObjects(t.Context(), deleteInput)
+			_, err := client.DeleteObjects(ctx, deleteInput)
 			if err != nil {
 				if isAWSResourceNotFoundError(err) {
 					t.Logf("S3 bucket %s was deleted during cleanup", bucketName)
@@ -332,7 +395,7 @@ func cleanS3Bucket(t *testing.T, client *s3.Client, bucketName string) {
 				},
 			}
 
-			_, err := client.DeleteObjects(t.Context(), deleteInput)
+			_, err := client.DeleteObjects(ctx, deleteInput)
 			if err != nil {
 				if isAWSResourceNotFoundError(err) {
 					t.Logf("S3 bucket %s was deleted during cleanup", bucketName)
@@ -371,22 +434,23 @@ func FileIsInFolder(t *testing.T, name string, path string) bool {
 	return found
 }
 
-func RunValidateAllWithIncludeAndGetIncludedModules(t *testing.T, rootModulePath string, includeModulePaths []string, strictInclude bool) []string {
+func RunValidateAllWithIncludeAndGetIncludedModules(
+	t *testing.T,
+	rootModulePath string,
+	includeModulePaths []string,
+) []string {
 	t.Helper()
 
-	cmdParts := []string{
+	cmdParts := make([]string, 0, 9+2*len(includeModulePaths)) //nolint:mnd
+	cmdParts = append(cmdParts,
 		"terragrunt", "run", "--all", "validate",
 		"--non-interactive",
 		"--log-level", "debug",
 		"--working-dir", rootModulePath,
-	}
+	)
 
 	for _, module := range includeModulePaths {
 		cmdParts = append(cmdParts, "--queue-include-dir", module)
-	}
-
-	if strictInclude {
-		cmdParts = append(cmdParts, "--queue-strict-include")
 	}
 
 	cmd := strings.Join(cmdParts, " ")
@@ -405,17 +469,65 @@ func RunValidateAllWithIncludeAndGetIncludedModules(t *testing.T, rootModulePath
 
 	require.NoError(t, err)
 
-	require.NoError(t, err)
-
-	includedModulesRegexp, err := regexp.Compile(`=> Unit (.+) \(excluded: (true|false)`)
-	require.NoError(t, err)
+	includedModulesRegexp := regexp.MustCompile(`=> Unit (.+) \(excluded: (true|false)`)
 
 	matches := includedModulesRegexp.FindAllStringSubmatch(validateAllStderr.String(), -1)
 	includedModules := []string{}
 
 	for _, match := range matches {
 		if match[2] == "false" {
-			includedModules = append(includedModules, GetPathRelativeTo(t, match[1], rootModulePath))
+			includedModules = append(includedModules, match[1])
+		}
+	}
+
+	sort.Strings(includedModules)
+
+	return includedModules
+}
+
+func RunValidateAllWithFilteredPlusDependenciesAndGetIncludedModules(
+	t *testing.T,
+	workDir string,
+	units []string,
+) []string {
+	t.Helper()
+
+	cmdParts := make([]string, 0, 9+2*len(units)) //nolint:mnd
+	cmdParts = append(cmdParts,
+		"terragrunt", "run", "--all", "validate",
+		"--non-interactive",
+		"--log-level", "debug",
+		"--working-dir", workDir,
+	)
+
+	for _, unit := range units {
+		cmdParts = append(cmdParts, "--filter", fmt.Sprintf("'{%s}...'", unit))
+	}
+
+	cmd := strings.Join(cmdParts, " ")
+
+	validateAllStdout := bytes.Buffer{}
+	validateAllStderr := bytes.Buffer{}
+	err := RunTerragruntCommand(
+		t,
+		cmd,
+		&validateAllStdout,
+		&validateAllStderr,
+	)
+
+	LogBufferContentsLineByLine(t, validateAllStdout, "run --all validate stdout")
+	LogBufferContentsLineByLine(t, validateAllStderr, "run --all validate stderr")
+
+	require.NoError(t, err)
+
+	includedModulesRegexp := regexp.MustCompile(`=> Unit (.+) \(excluded: (true|false)`)
+
+	matches := includedModulesRegexp.FindAllStringSubmatch(validateAllStderr.String(), -1)
+	includedModules := []string{}
+
+	for _, match := range matches {
+		if match[2] == "false" {
+			includedModules = append(includedModules, match[1])
 		}
 	}
 
@@ -427,7 +539,7 @@ func RunValidateAllWithIncludeAndGetIncludedModules(t *testing.T, rootModulePath
 func GetPathRelativeTo(t *testing.T, path string, basePath string) string {
 	t.Helper()
 
-	relPath, err := util.GetPathRelativeTo(path, basePath)
+	relPath, err := filepath.Rel(basePath, path)
 	require.NoError(t, err)
 
 	return relPath
@@ -439,7 +551,7 @@ func GetPathsRelativeTo(t *testing.T, basePath string, paths []string) []string 
 	relPaths := make([]string, len(paths))
 
 	for i, path := range paths {
-		relPath, err := util.GetPathRelativeTo(path, basePath)
+		relPath, err := filepath.Rel(basePath, path)
 		require.NoError(t, err)
 
 		relPaths[i] = relPath
@@ -453,10 +565,10 @@ func TestRunAllPlan(t *testing.T, args string) (string, string, string, error) {
 
 	tmpEnvPath := CopyEnvironment(t, TestFixtureOutDir)
 	CleanupTerraformFolder(t, tmpEnvPath)
-	testPath := util.JoinPath(tmpEnvPath, TestFixtureOutDir)
+	testPath := filepath.Join(tmpEnvPath, TestFixtureOutDir)
 
 	// run plan with output directory
-	stdout, stderr, err := RunTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run --all plan --non-interactive --log-level trace --working-dir %s %s", testPath, args))
+	stdout, stderr, err := RunTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run --all plan --non-interactive --working-dir %s %s", testPath, args))
 
 	return tmpEnvPath, stdout, stderr, err
 }
@@ -474,7 +586,7 @@ func RunNetworkMirrorServer(t *testing.T, ctx context.Context, urlPrefix, provid
 
 	fs := http.FileServer(http.Dir(providerDir))
 
-	withGz := gziphandler.GzipHandler(http.StripPrefix(urlPrefix, fs))
+	withGz := GzipHandler(http.StripPrefix(urlPrefix, fs))
 
 	mux.HandleFunc(urlPrefix, func(resp http.ResponseWriter, req *http.Request) {
 		if token != "" {
@@ -521,7 +633,13 @@ type FakeProvider struct {
 }
 
 func (provider *FakeProvider) archiveName() string {
-	return fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip", provider.Name, provider.Version, provider.PlatformOS, provider.PlatformArch)
+	return fmt.Sprintf(
+		"terraform-provider-%s_%s_%s_%s.zip",
+		provider.Name,
+		provider.Version,
+		provider.PlatformOS,
+		provider.PlatformArch,
+	)
 }
 
 func (provider *FakeProvider) filename() string {
@@ -751,33 +869,47 @@ func ValidateOutput(t *testing.T, outputs map[string]TerraformOutput, key string
 	assert.Equalf(t, output.Value, value, "Expected output %s to be %t", key, value)
 }
 
-// WrappedBinary - return which binary will be wrapped by Terragrunt, useful in CICD to run same tests against tofu and terraform
-func WrappedBinary() string {
-	value, found := os.LookupEnv("TG_TF_PATH")
-	if !found {
-		// if env variable is not defined, try to check through executing command
-		if util.IsCommandExecutable(context.Background(), TofuBinary, "-version") {
-			return TofuBinary
+// wrappedBinaryOnce memoizes the detected wrapped binary. The result is stable
+// for the lifetime of the process (env vars and installed binaries don't
+// change during a test run), so paying for detection once is enough.
+var (
+	wrappedBinaryOnce   sync.Once
+	wrappedBinaryCached string
+)
+
+// WrappedBinary returns which binary will be wrapped by Terragrunt. The
+// detection runs at most once per process; subsequent calls return the cached
+// value. The ctx is used only on the first call.
+func WrappedBinary(ctx context.Context) string {
+	wrappedBinaryOnce.Do(func() {
+		if value, found := os.LookupEnv("TG_TF_PATH"); found {
+			wrappedBinaryCached = filepath.Base(value)
+			return
 		}
 
-		return TerraformBinary
-	}
+		if util.IsCommandExecutable(vexec.NewOSExec(), ctx, TofuBinary, "-version") {
+			wrappedBinaryCached = TofuBinary
+			return
+		}
 
-	return filepath.Base(value)
+		wrappedBinaryCached = TerraformBinary
+	})
+
+	return wrappedBinaryCached
 }
 
-// ExpectedWrongCommandErr - return expected error message for wrong command
-func ExpectedWrongCommandErr(command string) error {
-	if WrappedBinary() == TofuBinary {
+// ExpectedWrongCommandErr returns the expected error message for a wrong command.
+func ExpectedWrongCommandErr(ctx context.Context, command string) error {
+	if WrappedBinary(ctx) == TofuBinary {
 		return run.WrongTofuCommand(command)
 	}
 
 	return run.WrongTerraformCommand(command)
 }
 
-// IsTerraform checks if the wrapped binary currently in use is the Terraform binary.
-func IsTerraform() bool {
-	return WrappedBinary() == TerraformBinary
+// IsTerraform reports whether the wrapped binary is Terraform.
+func IsTerraform(ctx context.Context) bool {
+	return WrappedBinary(ctx) == TerraformBinary
 }
 
 // IsTerraform110OrHigher checks if the installed Terraform binary is version 1.10.0 or higher.
@@ -789,11 +921,11 @@ func IsTerraform110OrHigher(t *testing.T) bool {
 		requiredMinor = 10
 	)
 
-	if !IsTerraform() {
+	if !IsTerraform(t.Context()) {
 		return false
 	}
 
-	output, err := exec.CommandContext(t.Context(), WrappedBinary(), "-version").Output()
+	output, err := exec.CommandContext(t.Context(), WrappedBinary(t.Context()), "-version").Output()
 	require.NoError(t, err)
 
 	matches := regexp.MustCompile(`Terraform v(\d+)\.(\d+)\.`).FindStringSubmatch(string(output))
@@ -809,13 +941,47 @@ func IsTerraform110OrHigher(t *testing.T) bool {
 }
 
 // IsOpenTofuInstalled checks if OpenTofu is installed.
-func IsOpenTofuInstalled() bool {
-	return util.IsCommandExecutable(context.Background(), TofuBinary, "-version")
+func IsOpenTofuInstalled(ctx context.Context) bool {
+	return util.IsCommandExecutable(vexec.NewOSExec(), ctx, TofuBinary, "-version")
+}
+
+// IsOpenTofu112OrHigher reports whether the wrapped binary is OpenTofu 1.12.0
+// or higher. The registry-side `packages` field that carries multi-platform
+// hashes is already live for all users, but the OpenTofu binary itself only
+// began consuming it in 1.12. Tests that invoke `tofu init` directly and
+// assert on multi-platform h1 hashes in `.terraform.lock.hcl` should gate on
+// this; tests that consume the field via Terragrunt's provider cache server
+// do not need to.
+func IsOpenTofu112OrHigher(t *testing.T) bool {
+	t.Helper()
+
+	const (
+		requiredMajor = 1
+		requiredMinor = 12
+	)
+
+	if IsTerraform(t.Context()) {
+		return false
+	}
+
+	output, err := exec.CommandContext(t.Context(), TofuBinary, "-version").Output()
+	require.NoError(t, err)
+
+	matches := regexp.MustCompile(`OpenTofu v(\d+)\.(\d+)\.`).FindStringSubmatch(string(output))
+	require.Len(t, matches, semverPartsLen, "Expected OpenTofu version to be in the format 'OpenTofu v1.12.0'")
+
+	major, err := strconv.Atoi(matches[1])
+	require.NoError(t, err)
+
+	minor, err := strconv.Atoi(matches[2])
+	require.NoError(t, err)
+
+	return major > requiredMajor || (major == requiredMajor && minor >= requiredMinor)
 }
 
 // IsTerraformInstalled checks if Terraform is installed.
-func IsTerraformInstalled() bool {
-	return util.IsCommandExecutable(context.Background(), TerraformBinary, "-version")
+func IsTerraformInstalled(ctx context.Context) bool {
+	return util.IsCommandExecutable(vexec.NewOSExec(), ctx, TerraformBinary, "-version")
 }
 
 // IsNativeS3LockingSupported checks if the installed Terraform binary supports native S3 locking.
@@ -830,7 +996,7 @@ func IsNativeS3LockingSupported(t *testing.T) bool {
 		tofuRequiredMinor      = 10
 	)
 
-	if IsTerraform() {
+	if IsTerraform(t.Context()) {
 		output, err := exec.CommandContext(t.Context(), TerraformBinary, "-version").Output()
 		require.NoError(t, err)
 
@@ -882,35 +1048,31 @@ func FindFilesWithExtension(dir string, ext string) ([]string, error) {
 func CleanupTerraformFolder(t *testing.T, templatesPath string) {
 	t.Helper()
 
-	RemoveFile(t, util.JoinPath(templatesPath, TerraformState))
-	RemoveFile(t, util.JoinPath(templatesPath, TerraformStateBackup))
-	RemoveFile(t, util.JoinPath(templatesPath, TerragruntDebugFile))
-	RemoveFolder(t, util.JoinPath(templatesPath, TerraformFolder))
+	RemoveFile(t, filepath.Join(templatesPath, TerraformState))
+	RemoveFile(t, filepath.Join(templatesPath, TerraformStateBackup))
+	RemoveFile(t, filepath.Join(templatesPath, TerragruntDebugFile))
+	RemoveFolder(t, filepath.Join(templatesPath, TerraformFolder))
 }
 
 func CleanupTerragruntFolder(t *testing.T, templatesPath string) {
 	t.Helper()
 
-	RemoveFolder(t, util.JoinPath(templatesPath, TerragruntCache))
+	RemoveFolder(t, filepath.Join(templatesPath, TerragruntCache))
 }
 
 func RemoveFile(t *testing.T, path string) {
 	t.Helper()
 
-	if util.FileExists(path) {
-		if err := os.Remove(path); err != nil {
-			t.Fatalf("Error while removing %s: %v", path, err)
-		}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Error while removing %s: %v", path, err)
 	}
 }
 
 func RemoveFolder(t *testing.T, path string) {
 	t.Helper()
 
-	if util.FileExists(path) {
-		if err := os.RemoveAll(path); err != nil {
-			t.Fatalf("Error while removing %s: %v", path, err)
-		}
+	if err := os.RemoveAll(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Error while removing %s: %v", path, err)
 	}
 }
 
@@ -926,7 +1088,11 @@ func RunTerragruntCommandWithContext(
 
 	parser := shellwords.NewParser()
 
-	args, err := parser.Parse(command)
+	// Convert backslashes to forward slashes before parsing.
+	// shellwords treats backslashes as escape characters, corrupting Windows paths
+	// like C:\foo\bar into C:foobar. Forward slashes work fine since Terragrunt CLI
+	// normalizes paths internally (see cli/commands/commands.go).
+	args, err := parser.Parse(filepath.ToSlash(command))
 	require.NoError(t, err)
 
 	if !strings.Contains(command, "-log-format") && !strings.Contains(command, "-log-custom-format") {
@@ -947,15 +1113,23 @@ func RunTerragruntCommandWithContext(
 
 	t.Log(args)
 
-	opts := options.NewTerragruntOptionsWithWriters(writer, errwriter)
+	// Wrap writers with SyncWriter to prevent race conditions when multiple
+	// goroutines write concurrently (e.g., during "run --all" operations).
+	syncWriter := util.NewSyncWriter(writer)
+	syncErrWriter := util.NewSyncWriter(errwriter)
+
+	opts := options.NewTerragruntOptions()
+
+	v := venv.OSVenv()
+	v.Writers = writerpkg.Writers{Writer: syncWriter, ErrWriter: syncErrWriter}
 
 	l := log.New(
-		log.WithOutput(errwriter),
+		log.WithOutput(syncErrWriter),
 		log.WithLevel(options.DefaultLogLevel),
 		log.WithFormatter(format.NewFormatter(format.NewPrettyFormatPlaceholders())),
 	)
 
-	app := cli.NewApp(l, opts) //nolint:contextcheck
+	app := cli.NewApp(l, opts, v)
 
 	ctx = log.ContextWithLogger(ctx, l)
 
@@ -1024,7 +1198,7 @@ func RunTerragruntRedirectOutput(t *testing.T, command string, writer io.Writer,
 			stderr = stderrAsBuffer.String()
 		}
 
-		t.Fatalf("Failed to run Terragrunt command '%s' due to error: %s\n\nStdout: %s\n\nStderr: %s", command, errors.ErrorStack(err), stdout, stderr)
+		t.Fatalf("Failed to run Terragrunt command '%s' due to error: %s\n\nStdout: %s\n\nStderr: %s", command, err.Error(), stdout, stderr)
 	}
 }
 
@@ -1032,7 +1206,7 @@ func CreateEmptyStateFile(t *testing.T, testPath string) {
 	t.Helper()
 
 	// create empty terraform.tfstate file
-	file, err := os.Create(util.JoinPath(testPath, TerraformState))
+	file, err := os.Create(filepath.Join(testPath, TerraformState))
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
 }
@@ -1047,7 +1221,7 @@ func RunTerragruntValidateInputs(t *testing.T, moduleDir string, extraArgs []str
 	}
 
 	cmd := fmt.Sprintf(
-		"terragrunt hcl validate --inputs %s --log-level trace --non-interactive --working-dir %s",
+		"terragrunt hcl validate --inputs %s --non-interactive --working-dir %s",
 		strings.Join(extraArgs, " "),
 		moduleDir,
 	)
@@ -1064,20 +1238,20 @@ func RunTerragruntValidateInputs(t *testing.T, moduleDir string, extraArgs []str
 func CreateTmpTerragruntConfigWithParentAndChild(t *testing.T, parentPath string, childRelPath string, s3BucketName string, parentConfigFileName string, childConfigFileName string) string {
 	t.Helper()
 
-	tmpDir := t.TempDir()
+	tmpDir := TmpDirWOSymlinks(t)
 
-	childDestPath := util.JoinPath(tmpDir, childRelPath)
+	childDestPath := filepath.Join(tmpDir, childRelPath)
 
 	if err := os.MkdirAll(childDestPath, allPermissions); err != nil {
 		t.Fatalf("Failed to create temp dir %s due to error %v", childDestPath, err)
 	}
 
-	parentTerragruntSrcPath := util.JoinPath(parentPath, parentConfigFileName)
-	parentTerragruntDestPath := util.JoinPath(tmpDir, parentConfigFileName)
+	parentTerragruntSrcPath := filepath.Join(parentPath, parentConfigFileName)
+	parentTerragruntDestPath := filepath.Join(tmpDir, parentConfigFileName)
 	CopyTerragruntConfigAndFillPlaceholders(t, parentTerragruntSrcPath, parentTerragruntDestPath, s3BucketName, "not-used", "not-used")
 
-	childTerragruntSrcPath := util.JoinPath(util.JoinPath(parentPath, childRelPath), childConfigFileName)
-	childTerragruntDestPath := util.JoinPath(childDestPath, childConfigFileName)
+	childTerragruntSrcPath := filepath.Join(parentPath, childRelPath, childConfigFileName)
+	childTerragruntDestPath := filepath.Join(childDestPath, childConfigFileName)
 	CopyTerragruntConfigAndFillPlaceholders(t, childTerragruntSrcPath, childTerragruntDestPath, s3BucketName, "not-used", "not-used")
 
 	return childTerragruntDestPath
@@ -1098,13 +1272,6 @@ func IsTerragruntProviderCacheEnabled(t *testing.T) bool {
 	}
 
 	return false
-}
-
-func CreateGitRepo(t *testing.T, dir string) {
-	t.Helper()
-
-	commandOutput, err := exec.CommandContext(t.Context(), "git", "init", dir).CombinedOutput()
-	require.NoErrorf(t, err, "Error initializing git repo: %v\n%s", err, string(commandOutput))
 }
 
 // HCLFilesInDir returns a list of all HCL files in a directory.
@@ -1198,4 +1365,47 @@ func isAWSResourceNotFoundError(err error) bool {
 	return errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NoSuchBucket" ||
 		apiErr.ErrorCode() == "NotFound" ||
 		apiErr.ErrorCode() == "ResourceNotFoundException")
+}
+
+// GzipHandler gzip-compresses responses when the client accepts gzip encoding.
+func GzipHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		if !strings.Contains(req.Header.Get("Accept-Encoding"), "gzip") {
+			h.ServeHTTP(resp, req)
+			return
+		}
+
+		gz := gzip.NewWriter(resp)
+
+		defer func() { _ = gz.Close() }()
+
+		h.ServeHTTP(&gzipResponseWriter{ResponseWriter: resp, gz: gz}, req)
+	})
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz          *gzip.Writer
+	wroteHeader bool
+}
+
+func (w *gzipResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+
+	w.wroteHeader = true
+
+	// length no longer matches once the body is compressed
+	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Encoding", "gzip")
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *gzipResponseWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	return w.gz.Write(b)
 }
